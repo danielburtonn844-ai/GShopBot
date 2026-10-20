@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Lint (ruff)
+        run: |
+          pip install ruff
+          ruff check main.py examples
+
+      - name: Syntax check
+        run: python -m compileall -q main.py examples verify_issues.py
+
+      - name: Self-check (7200+ assertions, no network)
+        run: python test_bot_full.py
+
+      - name: Issue regression tests
+        run: python verify_issues.py
+
+      - name: Import smoke test
+        run: |
+          BOT_TOKEN=1:test ADMIN_ID=100000000 python -c "
+          import sys
+          sys.path.insert(0, '.')
+          from examples import runtime
+          from examples import chain_watch, grab_service, shop_service, models
+          print('imports ok, VERSION =', runtime.VERSION)
+          "

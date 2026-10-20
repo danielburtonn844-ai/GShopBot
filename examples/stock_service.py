@@ -15,7 +15,7 @@ from typing import Any
 
 from telegram import InputMediaPhoto
 
-from .models import STOCK_TYPES, Database, Order, Product, StockItem, now_iso
+from .models import Database, Order, StockItem
 
 logger = logging.getLogger(__name__)
 

@@ -1,0 +1,36 @@
+[project]
+name = "gshopbot"
+version = "2.6.1"
+description = "Telegram 自助报单 + 积分商城 + 抢单派单机器人"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "fenghaogou" }]
+dependencies = [
+    "python-telegram-bot==22.8",
+    "python-dotenv==1.2.4",
+    "httpx==0.28.1",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+extend-exclude = ["venv", ".venv", "__pycache__"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle
+    "F",   # pyflakes
+    "W",   # warnings
+    "I",   # isort
+    "UP",  # pyupgrade
+    "B",   # bugbear
+]
+ignore = [
+    "E501",  # 行长由 line-length 统一处理，中文注释按字符计容易误报
+    "B008",  # telegram.ext 惯用默认参数里调函数
+]
+
+[tool.ruff.lint.per-file-ignores]
+"test_bot_full.py" = ["E402", "F841", "B"]
+"verify_issues.py" = ["E402"]

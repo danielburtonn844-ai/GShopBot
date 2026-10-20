@@ -147,57 +147,79 @@ async def fetch_tron_usdt_incoming(
     min_timestamp_ms: int = 0,
     limit: int = 50,
     timeout: float = 15.0,
+    max_pages: int = 5,
 ) -> list[ChainTx]:
     """拉取入账到 address 的 USDT-TRC20 转账（按时间升序返回）。
 
     仅取 only_to=true + 官方 USDT 合约，过滤掉其它 TRC20 代币与转出记录。
-    网络/接口异常返回空列表（轮询任务下轮再试），绝不抛炸主循环。
+    网络/接口异常返回已拉到的部分（幂等表兜住重复），绝不抛炸主循环。
+
+    分页：TronGrid 单页上限 200。历史记录超过一页时若不翻页，按 asc 排序会
+    永远只读到最早的一页，之后的新转账永远进不来。这里按 meta.fingerprint
+    循环翻页（最多 max_pages 页），配合调用方传入的 min_timestamp_ms 时间游标，
+    保证新单不漏、旧单不重复扫。
     """
-    params: dict[str, str] = {
-        "only_to": "true",
-        "contract_address": USDT_TRC20_CONTRACT,
-        "limit": str(max(1, min(limit, 200))),
-        "order_by": "block_timestamp,asc",
-    }
-    if min_timestamp_ms > 0:
-        params["min_timestamp"] = str(min_timestamp_ms)
+    page_size = max(1, min(limit, 200))
     headers = {"TRON-PRO-API-KEY": api_key} if api_key else {}
+    out: list[ChainTx] = []
+    seen: set[str] = set()
+    fingerprint = ""
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
-            resp = await client.get(
-                f"{TRONGRID_BASE}/v1/accounts/{address}/transactions/trc20",
-                params=params,
-                headers=headers,
-            )
-            resp.raise_for_status()
-            payload = resp.json()
+            for _page in range(max(1, max_pages)):
+                params: dict[str, str] = {
+                    "only_to": "true",
+                    "contract_address": USDT_TRC20_CONTRACT,
+                    "limit": str(page_size),
+                    "order_by": "block_timestamp,asc",
+                }
+                if min_timestamp_ms > 0:
+                    params["min_timestamp"] = str(min_timestamp_ms)
+                if fingerprint:
+                    params["fingerprint"] = fingerprint
+                resp = await client.get(
+                    f"{TRONGRID_BASE}/v1/accounts/{address}/transactions/trc20",
+                    params=params,
+                    headers=headers,
+                )
+                resp.raise_for_status()
+                payload = resp.json()
+
+                rows = payload.get("data") or []
+                for item in rows:
+                    try:
+                        token = item.get("token_info") or {}
+                        # 双保险：即便传了 contract_address，也再核一次，防止假 USDT 代币钓鱼
+                        if token.get("address") != USDT_TRC20_CONTRACT:
+                            continue
+                        txid = str(item.get("transaction_id") or "")
+                        if not txid or txid in seen:
+                            continue
+                        amount = parse_chain_amount(
+                            str(item.get("value") or "0"), int(token.get("decimals", TOKEN_DECIMALS))
+                        )
+                        if amount <= 0:
+                            continue
+                        seen.add(txid)
+                        out.append(ChainTx(
+                            txid=txid,
+                            amount=amount,
+                            sender=str(item.get("from") or ""),
+                            timestamp=int(item.get("block_timestamp") or 0) // 1000,
+                            memo="",
+                        ))
+                    except Exception as exc:  # 单条脏数据不影响整批
+                        logger.warning("TronGrid 单条解析失败：%s", exc)
+                        continue
+
+                meta = payload.get("meta") or {}
+                fingerprint = str(meta.get("fingerprint") or "")
+                # 没有下一页指纹，或本页未满（已是最后一页）→ 结束翻页
+                if not fingerprint or len(rows) < page_size:
+                    break
     except Exception as exc:
         logger.warning("TronGrid 拉取失败：%s", exc)
-        return []
-
-    out: list[ChainTx] = []
-    for item in payload.get("data") or []:
-        try:
-            token = item.get("token_info") or {}
-            # 双保险：即便传了 contract_address，也再核一次，防止假 USDT 代币钓鱼
-            if token.get("address") != USDT_TRC20_CONTRACT:
-                continue
-            txid = str(item.get("transaction_id") or "")
-            if not txid:
-                continue
-            amount = parse_chain_amount(str(item.get("value") or "0"), int(token.get("decimals", TOKEN_DECIMALS)))
-            if amount <= 0:
-                continue
-            out.append(ChainTx(
-                txid=txid,
-                amount=amount,
-                sender=str(item.get("from") or ""),
-                timestamp=int(item.get("block_timestamp") or 0) // 1000,
-                memo="",
-            ))
-        except Exception as exc:  # 单条脏数据不影响整批
-            logger.warning("TronGrid 单条解析失败：%s", exc)
-            continue
+        return out
     return out
 
 
@@ -210,10 +232,12 @@ async def fetch_ton_usdt_incoming(
     api_key: str = "",
     limit: int = 50,
     timeout: float = 15.0,
+    min_timestamp: int = 0,
 ) -> list[ChainTx]:
     """拉取入账到 address 的 USDT Jetton 转账（按时间倒序拉取后翻转为升序返回）。
 
     仅取官方 USDT Jetton Master，comment 作为 memo 返回（业务层用它匹配充值单号）。
+    min_timestamp 为秒级起点（TonCenter 的 start_utime），用于增量扫描。
     网络/接口异常返回空列表（轮询任务下轮再试），绝不抛炸主循环。
     """
     params: dict[str, str] = {
@@ -223,6 +247,8 @@ async def fetch_ton_usdt_incoming(
         "limit": str(max(1, min(limit, 100))),
         "sort": "desc",
     }
+    if min_timestamp > 0:
+        params["start_utime"] = str(min_timestamp)
     headers = {"X-API-Key": api_key} if api_key else {}
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:

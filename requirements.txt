@@ -1,7 +1,5 @@
-# 实际使用（业务代码真实 import 的依赖）
-python-telegram-bot>=21.0
-python-dotenv>=1.0.0
-httpx>=0.27.0
-# 以下为传递/备用依赖：业务代码未直接 import，保留无害（python-telegram-bot 内部会用到 httpx 栈）
-requests>=2.31.0
-urllib3>=2.0.0
+# G Shop Bot · 运行依赖
+# 版本锁定：PTB 21→22 有破坏性变更，>= 会在某天 pip install 时装到不兼容版本
+python-telegram-bot==22.8
+python-dotenv==1.2.4
+httpx==0.28.1

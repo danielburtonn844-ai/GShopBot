@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
-from .models import GRAB_STATUS, GRABBER_STATUS, fmt_time
+from .models import fmt_time
 from .richtext import (
     TG_A_CAL,
     TG_A_KEY,

@@ -4,15 +4,22 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import random
-from datetime import datetime
-from decimal import Decimal
-from typing import Any
-
 import os
+import random
+import time
+from datetime import datetime
+from decimal import Decimal, InvalidOperation
+from typing import Any
 
 from telegram.error import RetryAfter
 
+from .chain_watch import (
+    ChainTx,
+    dec_to_str,
+    fetch_ton_usdt_incoming,
+    fetch_tron_usdt_incoming,
+)
+from .kkpay import KKPay
 from .models import (
     LOCAL_TZ,
     Admin,
@@ -28,16 +35,8 @@ from .models import (
     gen_product_id,
     gen_recharge_id,
     now_iso,
-    now_str,
 )
 from .okpay import OkPay
-from .kkpay import KKPay
-from .chain_watch import (
-    ChainTx,
-    dec_to_str,
-    fetch_ton_usdt_incoming,
-    fetch_tron_usdt_incoming,
-)
 from .richtext import (
     ICON_CHECK,
     ICON_DIAMOND,
@@ -107,29 +106,33 @@ class ShopService:
             return bool(settings.get("pay_ton_enabled", False)) and bool(settings.get("ton_wallet_address", ""))
         return False
 
-    def validate_recharge_amount(self, amount: float) -> str | None:
+    def validate_recharge_amount(self, amount: float | Decimal | str) -> str | None:
         """充值金额限额校验（安全兜底：所有渠道统一下单前必须过这里）。
-        返回 None 表示合法，否则返回给用户看的中文错误提示。"""
+        返回 None 表示合法，否则返回给用户看的中文错误提示。
+        全程 Decimal 比较：float 下 0.1+0.2 类误差会让边界值判断漂移。"""
         settings = self.db.get_settings()
         try:
-            min_v = float(settings.get("min_recharge_usdt", 1) or 1)
-        except (TypeError, ValueError):
-            min_v = 1.0
+            min_v = Decimal(str(settings.get("min_recharge_usdt", 1) or 1))
+        except (TypeError, ValueError, InvalidOperation):
+            min_v = Decimal("1")
         try:
-            max_v = float(settings.get("max_recharge_usdt", 1000) or 1000)
-        except (TypeError, ValueError):
-            max_v = 1000.0
-        if amount < min_v:
-            return f"❌ 单笔最低充值 <code>{min_v:g}</code> USDT"
-        if max_v > 0 and amount > max_v:
-            return f"❌ 单笔最高充值 <code>{max_v:g}</code> USDT（如需大额请联系客服）"
+            max_v = Decimal(str(settings.get("max_recharge_usdt", 1000) or 1000))
+        except (TypeError, ValueError, InvalidOperation):
+            max_v = Decimal("1000")
+        try:
+            amt = amount if isinstance(amount, Decimal) else Decimal(str(amount))
+        except (TypeError, ValueError, InvalidOperation):
+            return "❌ 充值金额格式错误"
+        if amt < min_v:
+            return f"❌ 单笔最低充值 <code>{dec_to_str(min_v)}</code> USDT"
+        if max_v > 0 and amt > max_v:
+            return f"❌ 单笔最高充值 <code>{dec_to_str(max_v)}</code> USDT（如需大额请联系客服）"
         return None
 
     def set_bot(self, bot: Any) -> None:
         self._bot = bot
 
     def add_admin(self, user_id: int, name: str = "") -> None:
-        from .models import Admin
         admin = Admin(
             user_id=user_id,
             name=name,
@@ -598,6 +601,9 @@ class ShopService:
         rate = settings.get("points_rate", 10)
         expected_str = ""
         pay_amount = amount
+        # 积分换算基准全程 Decimal：float 在 0.29/0.57/0.58 这类尾数上会少算 1 积分
+        # （如 float("10.29")*100 == 1028.9999999999998 → int() 得 1028，正确值 1029）
+        points_base = Decimal(str(amount))
         if chain == "trc20":
             suffix = self._alloc_tron_suffix()
             if suffix is None:
@@ -605,7 +611,8 @@ class ShopService:
                 return None
             expected = Decimal(int(amount)) + Decimal(suffix) / Decimal(1000)
             expected_str = dec_to_str(expected)
-            pay_amount = float(expected_str)  # 积分按实际应付（含尾数）换算
+            pay_amount = float(expected_str)  # amount 字段为 REAL，展示一律走 expected_str
+            points_base = expected            # 积分按实际应付（含尾数）换算
 
         user = self.db.get_user(user_id)
         recharge = Recharge(
@@ -613,7 +620,7 @@ class ShopService:
             user_id=user_id,
             username=user.username if user else "",
             amount=pay_amount,
-            points=int(pay_amount * rate),  # 规格：向下取整
+            points=int(points_base * Decimal(str(rate))),  # 规格：向下取整（Decimal 精确）
             status="pending",
             created_at=now_iso(),
             gateway=chain,
@@ -626,26 +633,70 @@ class ShopService:
         self.db.save_recharge(recharge)
         return recharge
 
+    # ---------- 链上扫描游标 ----------
+
+    def _scan_cursor(self, key: str, fallback_ms: int) -> int:
+        """读持久化扫描游标（毫秒）。无值或非法时返回 fallback。"""
+        try:
+            v = int(self.db.get_setting(key, 0) or 0)
+        except (TypeError, ValueError):
+            v = 0
+        return v if v > 0 else fallback_ms
+
+    @staticmethod
+    def _oldest_pending_ms(pending: list[Recharge]) -> int:
+        """最早待支付单的创建时间（毫秒）。作为扫描起点的兜底下限。"""
+        stamps: list[int] = []
+        for r in pending:
+            try:
+                stamps.append(int(datetime.fromisoformat(r.created_at).timestamp() * 1000))
+            except (TypeError, ValueError):
+                continue
+        return min(stamps) if stamps else int(time.time() * 1000)
+
     async def check_chain_recharges(self) -> list[Recharge]:
-        """轮询两条链的冷钱包入账，匹配到待支付单即入账。返回本轮新到账的充值单。"""
+        """轮询两条链的冷钱包入账，匹配到待支付单即入账。返回本轮新到账的充值单。
+
+        增量扫描：每轮只扫「游标之后」的转账，并把本轮最大时间戳存回游标。
+        扫描起点取「游标」与「最早待支付单前 10 分钟」两者更早者，再回退 60 秒重叠，
+        既避免每轮重扫全部历史（TronGrid 单页 50 条会卡在最早一页导致新单漏检），
+        也保证重启或首次部署时不漏掉旧单。
+        """
         settings = self.db.get_settings()
         paid: list[Recharge] = []
         pending = [r for r in self.db.list_pending_recharges() if r.chain in CHAIN_GATEWAYS]
         if not pending:
             return paid
 
+        oldest_ms = self._oldest_pending_ms(pending) - 10 * 60 * 1000
+        overlap_ms = 60 * 1000  # 60 秒重叠窗口，防同秒边界漏单
+
         if settings.get("pay_tron_enabled") and settings.get("tron_wallet_address"):
+            cursor = self._scan_cursor("tron_scan_cursor_ms", oldest_ms)
+            scan_from = max(0, min(cursor, oldest_ms) - overlap_ms)
             txs = await fetch_tron_usdt_incoming(
                 settings["tron_wallet_address"],
                 api_key=settings.get("trongrid_api_key", "") or "",
+                min_timestamp_ms=scan_from,
             )
+            if txs:
+                self.db.set_setting(
+                    "tron_scan_cursor_ms", max(tx.timestamp * 1000 for tx in txs)
+                )
             paid.extend(self._match_tron_txs(pending, txs))
 
         if settings.get("pay_ton_enabled") and settings.get("ton_wallet_address"):
+            cursor = self._scan_cursor("ton_scan_cursor_ms", oldest_ms)
+            scan_from_s = max(0, min(cursor, oldest_ms) - overlap_ms) // 1000
             txs = await fetch_ton_usdt_incoming(
                 settings["ton_wallet_address"],
                 api_key=settings.get("toncenter_api_key", "") or "",
+                min_timestamp=scan_from_s,
             )
+            if txs:
+                self.db.set_setting(
+                    "ton_scan_cursor_ms", max(tx.timestamp for tx in txs) * 1000
+                )
             paid.extend(self._match_ton_txs(pending, txs))
         return paid
 

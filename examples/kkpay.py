@@ -207,7 +207,7 @@ def sign_confirm_reply(secret: str, txid: str, decision: str) -> str:
     """
     d = str(decision).strip().upper()
     return base64.b64encode(
-        hmac.new(secret.encode("utf-8"), f"{txid}:{d}".encode("utf-8"), hashlib.sha256).digest()
+        hmac.new(secret.encode("utf-8"), f"{txid}:{d}".encode(), hashlib.sha256).digest()
     ).decode()
 
 

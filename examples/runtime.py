@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import logging
 import os
-import sys
 
 from dotenv import load_dotenv
 
@@ -23,7 +22,7 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 # 版本号：每次交付必须递增并在 CHANGELOG.md 记录（见交付规范）
-VERSION = "2.6.1"
+VERSION = "2.6.2"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:

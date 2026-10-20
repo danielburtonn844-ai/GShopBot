@@ -12,7 +12,6 @@ from .models import PRODUCT_STATUS, TAGS, escape_html
 from .richtext import clean_label, is_not_modified, match_icon, strip_html_tags
 from .runtime import db
 
-
 # ---------- 自定义 Emoji 图标（高级会员表情按钮左侧图标） ----------
 # 图标库在 examples/richtext.py，按钮经 kb() 统一自动匹配图标；正文内联表情用 TG_*。
 

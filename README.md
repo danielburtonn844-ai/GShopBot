@@ -4,7 +4,11 @@
 
 **Telegram 自助报单 + 积分商城 + 抢单派单机器人**
 
-版本 `v2.6.1` · Python 3.10+ · SQLite · python-telegram-bot 21+
+版本 `v2.6.1` · Python 3.10+ · SQLite · python-telegram-bot 22.8
+
+[![CI](https://github.com/danielburtonn844-ai/GShopBot/actions/workflows/ci.yml/badge.svg)](https://github.com/danielburtonn844-ai/GShopBot/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12-blue.svg)](https://www.python.org/)
 
 <br>
 
@@ -109,10 +113,23 @@ vim .env
 ### 4. 跑自检（推荐）
 
 ```bash
-venv/bin/python3 test_bot_full.py
+python3 test_bot_full.py
 ```
 
-看到 `✅ 通过 7200+ 项   ❌ 失败 0 项` 即可用。自检强制走 `SHOP_DB_PATH` 隔离，不会碰正式库。
+看到 `✅ 通过 7200+ 项   ❌ 失败 0 项` 即可用。自检强制走 `SHOP_DB_PATH` 隔离，不会碰正式库，全程不需要联网（链上 API 走 mock）。
+
+回归测试（覆盖三个已修复的资金/风控缺陷）：
+
+```bash
+python3 verify_issues.py
+```
+
+代码风格检查：
+
+```bash
+pip install ruff
+ruff check main.py examples
+```
 
 ### 5. 启动
 
@@ -190,6 +207,11 @@ examples/
 └── jobs.py                 后台任务（支付轮询 / 链上轮询 / 抢单时效 / 日报 / 备份）
 data/
 └── shop.db                 数据库（自动生成，已 gitignore）
+
+test_bot_full.py            自检脚本（7200+ 断言，全离线）
+verify_issues.py            回归测试（佣金竞态 / 链上分页 / 更新订阅 / 金额精度）
+.github/workflows/ci.yml    CI：ruff + 语法 + 自检 + 回归，Python 3.10/3.11/3.12
+pyproject.toml              项目元数据 + ruff 规则
 ```
 
 ---
@@ -198,14 +220,29 @@ data/
 
 | 项 | 说明 |
 |---|---|
-| **金额精度** | 全程 `Decimal` + 字符串，禁用 float |
-| **资金安全** | 所有余额变动在事务内；`balance_frozen` 与 `merchant_income(status='frozen')` 恒等 |
+| **金额精度** | 充值积分换算、提现汇率、限额校验全程 `Decimal`；提现用 `ROUND_HALF_UP` 而非 Python 默认的银行家舍入 |
+| **资金安全** | 所有余额变动在事务内；佣金解冻走 CAS（`WHERE status='frozen'`），自动与手动解冻交错时不会重复入账 |
 | **并发抢单** | `UPDATE ... WHERE grab_status='waiting'` 条件更新，天然原子，无锁 |
 | **链上幂等** | `chain_txids` 表以 txid 为主键，入账 `INSERT OR IGNORE`，重启或重复轮询不重复加分 |
+| **链上增量扫描** | 游标持久化在 settings（`tron_scan_cursor_ms` / `ton_scan_cursor_ms`），每轮只扫游标之后；TronGrid 按 `meta.fingerprint` 翻页，历史超过单页容量也不会漏新单 |
+| **更新订阅** | `run_polling(allowed_updates=...)` 显式订阅 `chat_member`——Bot API 默认集合不含它，不显式声明则退群停权/邀请链接校验全部静默失效 |
 | **地址校验** | TRON Base58Check（T 开头 34 位）、TON friendly CRC16（EQ/UQ 48 位），不合法拒存 |
 | **限额下沉** | 限额校验在 service 层 `validate_recharge_amount`，所有渠道必经，改包绕不过 |
 | **尾数识别** | TRON 无 memo，用 `0.001~0.999` 唯一金额尾数匹配，尾数池 999 个，占满拒单不复用 |
 | **防偷老板** | 匿名派单卡片不含买家任何信息；群内公示只显示接单员编号 |
+
+### 已修复的历史缺陷
+
+| 缺陷 | 影响 | 修法 |
+|---|---|---|
+| 自动解冻与手动解冻交错执行 | 同一笔佣金被两次计入可提现余额（100 → 300） | `set_commission_status(..., expect="frozen")` 做 CAS，未命中则跳过记账 |
+| 手动解冻只查前 500 条冻结记录 | 超过 500 笔后更早的佣金无法解冻 | 新增 `get_grab_commission(cid)` 按主键取单 |
+| TRON 监听无分页、无时间游标 | 历史转账超过 50 笔后，新充值永远进不来 | `meta.fingerprint` 翻页 + 持久化扫描游标 + 60 秒重叠窗口 |
+| `run_polling()` 未指定 `allowed_updates` | `chat_member` 默认不投递，退群停权/专属链接风控静默失效 | 显式订阅 MESSAGE / CALLBACK_QUERY / CHAT_MEMBER / MY_CHAT_MEMBER |
+| 充值积分 `int(float(x) * rate)` | 尾数 0.29 / 0.57 / 0.58 时少算 1 积分 | 改 `int(Decimal(x) * Decimal(rate))` |
+| 提现 `round()` 银行家舍入 | 2.5 → 2，少付 0.5U | `Decimal.quantize(..., ROUND_HALF_UP)` |
+
+以上全部有回归用例，`python3 verify_issues.py` 可复现验证。
 
 ---
 

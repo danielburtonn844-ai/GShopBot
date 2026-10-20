@@ -647,8 +647,6 @@ def page_admin_grabbers(status: str = "", page: int = 0) -> tuple[str, InlineKey
     size = 8
     grabbers = db.list_grabbers(status=status, limit=size, offset=page * size)
     total = db.count_grabbers(status=status)
-    counts = {st: db.count_grabbers(st) for st in ("active", "rest", "suspended", "blacklist")}
-
     lines = [
         f"<b>🥷 接单员管理</b>（共 <code>{total}</code> 人）",
         "<i>点接单员进详情：改状态/解冻佣金/查单/删档</i>",
@@ -697,7 +695,7 @@ def page_admin_grabber_detail(uid: int) -> tuple[str, InlineKeyboardMarkup]:
     doing = db.count_grab_orders("grabbed", grabber_id=uid)
     frozen_cms = db.list_grab_commissions(grabber_id=uid, status="frozen", limit=5)
     lines = [
-        f"<b>🥷 接单员详情</b>",
+        "<b>🥷 接单员详情</b>",
         "━━━━━━━━━━━━━━",
         f"🪪 编号：<code>{g.display()}</code>",
         f"🆔 TG ID：<code>{g.user_id}</code>" + (f" · @{h(g.username)}" if g.username else ""),
@@ -756,7 +754,7 @@ def page_admin_grab_orders(st: str = "grabbed", page: int = 0) -> tuple[str, Inl
     total = db.count_grab_orders(st)
 
     lines = [
-        f"<b>📋 派单中心</b>",
+        "<b>📋 派单中心</b>",
         f"<i>当前：{_GRAB_STATUS_TEXT[st]}（共 {total} 笔）——商品自动发货不走派单，这里全是报单内容</i>",
         "",
     ]

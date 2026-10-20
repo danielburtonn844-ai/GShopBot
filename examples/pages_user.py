@@ -9,7 +9,7 @@ from __future__ import annotations
 from telegram import InlineKeyboardMarkup
 
 from .models import PRODUCT_KINDS, STOCK_TYPES, Recharge, fmt_time
-from .richtext import TG_CHECK, TG_DIAMOND, TG_MAIL, TG_STAR
+from .richtext import TG_DIAMOND, TG_MAIL, TG_STAR
 from .runtime import VERSION, db, service
 from .ui import get_points, h, kb, order_status_text, tags_text
 

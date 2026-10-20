@@ -19,36 +19,51 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
 from .models import STOCK_TYPES, SUPPLY_CHANNELS, now_iso
-from .richtext import TG_CHECK
-from .runtime import db, grab, service, stock, supply
-from .shop_service import BUY_FAIL_REASONS, CHAIN_GATEWAYS, GATEWAY_NAMES, PAY_GATEWAYS
-from .supply_service import CREATE_FAIL_REASONS
-from .ui import audit, clear_state, get_points, h, kb, send_or_edit
+from .pages_admin import (
+    _GRAB_SETTING_ITEMS,
+    page_admin,
+    page_admin_admins,
+    page_admin_broadcast,
+    page_admin_channels,
+    page_admin_finance,
+    page_admin_grab,
+    page_admin_grab_appeals,
+    page_admin_grab_orders,
+    page_admin_grab_settings,
+    page_admin_grab_withdrawals,
+    page_admin_grabber_detail,
+    page_admin_grabbers,
+    page_admin_logs,
+    page_admin_order,
+    page_admin_order_detail,
+    page_admin_payment,
+    page_admin_pcats,
+    page_admin_pdel_confirm,
+    page_admin_pedit,
+    page_admin_prod,
+    page_admin_refund_confirm,
+    page_admin_settings,
+    page_admin_user,
+    page_admin_user_detail,
+    page_admin_user_orders,
+    page_admin_user_points,
+)
 from .pages_grabber import (
     page_grab_appeals,
-    page_grab_done,
     page_grab_doing,
+    page_grab_done,
     page_grab_home,
     page_grab_money,
     page_grab_rank,
     page_grab_withdraw,
 )
-from .pages_user import (
-    page_balance,
-    page_buy_confirm,
-    page_detail,
-    page_force_join,
-    page_help,
-    page_list,
-    page_order_detail,
-    page_orders,
-    page_profile,
-    page_chain_pay,
-    page_recharge,
-    page_recharge_confirm,
-    page_recharge_history,
-    page_root,
-    page_search_results,
+from .pages_stock import (
+    page_admin_pool,
+    page_admin_pool_clear_confirm,
+    page_admin_pool_item,
+    page_admin_pool_prod,
+    restock_keyboard,
+    restock_prompt,
 )
 from .pages_supply import (
     SUPPLY_SWITCH_ON,
@@ -68,43 +83,27 @@ from .pages_supply import (
     page_supply_preview,
     supply_content_prompt,
 )
-from .pages_admin import (
-    _GRAB_SETTING_ITEMS,
-    page_admin,
-    page_admin_admins,
-    page_admin_broadcast,
-    page_admin_channels,
-    page_admin_finance,
-    page_admin_grab,
-    page_admin_grab_appeals,
-    page_admin_grab_orders,
-    page_admin_grab_settings,
-    page_admin_grab_withdrawals,
-    page_admin_grabber_detail,
-    page_admin_grabbers,
-    page_admin_logs,
-    page_admin_order,
-    page_admin_order_detail,
-    page_admin_pdel_confirm,
-    page_admin_pcats,
-    page_admin_payment,
-    page_admin_pedit,
-    page_admin_prod,
-    page_admin_refund_confirm,
-    page_admin_settings,
-    page_admin_user,
-    page_admin_user_detail,
-    page_admin_user_orders,
-    page_admin_user_points,
+from .pages_user import (
+    page_balance,
+    page_buy_confirm,
+    page_chain_pay,
+    page_detail,
+    page_force_join,
+    page_help,
+    page_list,
+    page_order_detail,
+    page_orders,
+    page_profile,
+    page_recharge,
+    page_recharge_confirm,
+    page_recharge_history,
+    page_root,
 )
-from .pages_stock import (
-    page_admin_pool,
-    page_admin_pool_clear_confirm,
-    page_admin_pool_item,
-    page_admin_pool_prod,
-    restock_keyboard,
-    restock_prompt,
-)
+from .richtext import TG_CHECK
+from .runtime import db, grab, service, stock, supply
+from .shop_service import BUY_FAIL_REASONS, CHAIN_GATEWAYS, GATEWAY_NAMES, PAY_GATEWAYS
+from .supply_service import CREATE_FAIL_REASONS
+from .ui import audit, clear_state, h, kb, send_or_edit
 
 logger = logging.getLogger(__name__)
 
@@ -1546,8 +1545,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
         await send_or_edit(
             query,
-            f"🔑 <b>你的专属入群链接</b>\n\n"
-            f"<blockquote>此链接只限你本人使用一次，进群即自动作废，切勿转发他人。</blockquote>",
+            "🔑 <b>你的专属入群链接</b>\n\n"
+            "<blockquote>此链接只限你本人使用一次，进群即自动作废，切勿转发他人。</blockquote>",
             InlineKeyboardMarkup([[
                 InlineKeyboardButton("🔗 点我进入接单群", url=link),
             ], [InlineKeyboardButton("⬅️ 接单中心", callback_data="gb:m")]]),
@@ -1651,8 +1650,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         try:
             await context.bot.send_message(
                 g.user_id,
-                f"🔑 <b>你的新专属入群链接</b>\n\n"
-                f"<blockquote>此链接只限你本人使用一次，进群即自动作废，切勿转发他人。</blockquote>",
+                "🔑 <b>你的新专属入群链接</b>\n\n"
+                "<blockquote>此链接只限你本人使用一次，进群即自动作废，切勿转发他人。</blockquote>",
                 parse_mode="HTML",
                 reply_markup=InlineKeyboardMarkup([[
                     InlineKeyboardButton("🔗 点我进入接单群", url=link),

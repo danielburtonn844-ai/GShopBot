@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
@@ -25,8 +26,8 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from .models import (
     LOCAL_TZ,
     GrabAppeal,
-    GrabCommission,
     Grabber,
+    GrabCommission,
     Order,
     Withdrawal,
     escape_html,
@@ -40,7 +41,6 @@ from .richtext import (
     ICON_X_GRAB,
     ICON_X_NINJA,
     ICON_X_SPEAK,
-    TG_A_CAL,
     TG_A_CHEERS,
     TG_A_KEY,
     TG_A_MAIL,
@@ -50,7 +50,6 @@ from .richtext import (
     TG_X_BELL,
     TG_X_CHECK,
     TG_X_GRAB,
-    TG_X_LOCK,
     TG_X_MONEY,
     TG_X_NINJA,
     TG_X_WARN,
@@ -118,8 +117,14 @@ class GrabService:
             return 100
 
     def points_to_usdt(self, points: int) -> float:
-        """积分实时换算成 U，保留两位小数。"""
-        return round(int(points) / self.points_per_usdt(), 2)
+        """积分实时换算成 U，保留两位小数。
+        Decimal 计算后 ROUND_HALF_UP 再落 float：直接用 round() 会走银行家舍入，
+        500 积分 @ 200 汇率得 2.5 → round 得 2，实际应进 2.5（差 0.5U）。"""
+        rate = self.points_per_usdt()
+        q = (Decimal(int(points)) / Decimal(rate)).quantize(
+            Decimal("0.01"), rounding=ROUND_HALF_UP
+        )
+        return float(q)
 
     def usdt_text(self, points: int) -> str:
         """积分 + 折算 U 的组合展示：500 积分 ≈ 5.00 U。"""
@@ -621,7 +626,12 @@ class GrabService:
     # ==================================================================
 
     async def release_due_commissions(self) -> int:
-        """到期解冻（定时任务）：frozen → released，冻结余额转可提现。返回解冻笔数。"""
+        """到期解冻（定时任务）：frozen → released，冻结余额转可提现。返回解冻笔数。
+
+        资金安全要点：每笔都用 `expect="frozen"` 做 CAS。本方法在发送 Telegram 通知处
+        会 await 让出执行权，若管理员在此期间手动解冻了后面的佣金，恢复后 CAS 不命中，
+        直接跳过，不会把同一笔佣金二次计入可提现余额。
+        """
         if not self.settings.get("grab_auto_release"):
             return 0
         due = self.db.due_commissions(now_iso())
@@ -634,7 +644,12 @@ class GrabService:
                         # 档案被删的孤儿佣金：直接标记释放不再入账
                         self.db.set_commission_status(cm.id, "released", now_iso(), conn=conn)
                         continue
-                    self.db.set_commission_status(cm.id, "released", now_iso(), conn=conn)
+                    if not self.db.set_commission_status(
+                        cm.id, "released", now_iso(), conn=conn, expect="frozen"
+                    ):
+                        # 已被手动解冻（或并发解冻）抢先处理，跳过记账
+                        logger.info("佣金 %s 已被并发解冻，跳过", cm.id)
+                        continue
                     g.balance_frozen = max(0, g.balance_frozen - cm.amount)
                     g.balance_available += cm.amount
                     self.db.save_grabber(g, conn=conn)
@@ -654,16 +669,24 @@ class GrabService:
         return count
 
     def release_commission_manual(self, cid: int, operator_id: int = 0) -> bool:
-        """管理员手动解冻（auto_release 关闭时使用）。"""
+        """管理员手动解冻（auto_release 关闭时使用）。
+
+        与自动解冻共用 CAS 语义：只有库里状态仍是 frozen 才记账，
+        避免管理员连点两次、或与定时任务撞车时重复加余额。
+        """
         with self.db.atomic() as conn:
-            rows = self.db.list_grab_commissions(status="frozen", limit=500)
-            target = next((c for c in rows if c.id == cid), None)
-            if not target:
+            # 直接按主键取单，不依赖分页列表（原实现只查前 500 条冻结记录，
+            # 超过 500 笔后管理员无法解冻更早的佣金）
+            target = self.db.get_grab_commission(cid, conn=conn)
+            if not target or target.status != "frozen":
                 return False
             g = self.db.get_grabber(target.grabber_id, conn=conn)
             if not g:
                 return False
-            self.db.set_commission_status(cid, "released", now_iso(), conn=conn)
+            if not self.db.set_commission_status(
+                cid, "released", now_iso(), conn=conn, expect="frozen"
+            ):
+                return False
             g.balance_frozen = max(0, g.balance_frozen - target.amount)
             g.balance_available += target.amount
             self.db.save_grabber(g, conn=conn)

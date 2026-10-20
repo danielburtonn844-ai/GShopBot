@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 付费供需业务模块
 ================
@@ -19,7 +18,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
@@ -30,7 +29,6 @@ from .models import (
     SupplyPost,
     User,
     escape_html,
-    fmt_time,
     gen_supply_id,
     now_iso,
 )
@@ -43,7 +41,6 @@ from .richtext import (
     TG_MAIL,
     TG_STAR,
     send_html,
-    strip_html_tags,
 )
 
 logger = logging.getLogger(__name__)
@@ -177,7 +174,6 @@ class SupplyService:
 
     def post_keyboard(self, in_channel: bool = False) -> InlineKeyboardMarkup | None:
         """「我也要发供需」裂变按钮：频道里用 deep link，机器人里用 callback。"""
-        label = "📢 我也要发供需"
         if in_channel:
             bot = getattr(self._shop, "_bot", None)
             username = getattr(bot, "username", None) if bot else None

@@ -560,7 +560,7 @@ class SupplyPost:
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "SupplyPost":
+    def from_dict(cls, data: dict[str, Any]) -> SupplyPost:
         return cls(
             id=data.get("id", ""),
             user_id=data.get("user_id", 0),
@@ -732,7 +732,7 @@ class Grabber:
         return f"#{self.seq:04d} {label}" if self.seq else label
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "Grabber":
+    def from_dict(cls, data: dict[str, Any]) -> Grabber:
         return cls(
             user_id=int(data.get("user_id", 0) or 0),
             seq=int(data.get("seq", 0) or 0),
@@ -768,7 +768,7 @@ class GrabCommission:
     created_at: str = ""
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "GrabCommission":
+    def from_dict(cls, data: dict[str, Any]) -> GrabCommission:
         return cls(
             id=int(data.get("id", 0) or 0),
             order_id=data.get("order_id", "") or "",
@@ -798,7 +798,7 @@ class Withdrawal:
     created_at: str = ""
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "Withdrawal":
+    def from_dict(cls, data: dict[str, Any]) -> Withdrawal:
         return cls(
             id=data.get("id", "") or "",
             grabber_id=int(data.get("grabber_id", 0) or 0),
@@ -829,7 +829,7 @@ class GrabAppeal:
     created_at: str = ""
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "GrabAppeal":
+    def from_dict(cls, data: dict[str, Any]) -> GrabAppeal:
         return cls(
             id=int(data.get("id", 0) or 0),
             grabber_id=int(data.get("grabber_id", 0) or 0),
@@ -2291,6 +2291,14 @@ class Database:
         finally:
             conn.close()
 
+    def get_grab_commission(
+        self, cid: int, conn: sqlite3.Connection | None = None
+    ) -> GrabCommission | None:
+        """按主键取单笔佣金（手动解冻用，不依赖分页列表）。"""
+        with self._maybe_conn(conn) as c:
+            row = c.execute("SELECT * FROM grab_commissions WHERE id = ?", (cid,)).fetchone()
+            return GrabCommission.from_dict(dict(row)) if row else None
+
     def count_grab_commissions(self, grabber_id: int = 0, status: str = "") -> int:
         conn = self._get_conn()
         try:
@@ -2320,13 +2328,31 @@ class Database:
             conn.close()
 
     def set_commission_status(
-        self, cid: int, status: str, released_at: str = "", conn: sqlite3.Connection | None = None
-    ) -> None:
+        self,
+        cid: int,
+        status: str,
+        released_at: str = "",
+        conn: sqlite3.Connection | None = None,
+        expect: str | None = None,
+    ) -> bool:
+        """更新佣金状态。
+
+        expect 非空时做 CAS（compare-and-swap）：只有库中当前状态等于 expect 才更新，
+        返回是否命中。资金记账必须用 CAS 形式——自动解冻与手动解冻可能交错执行，
+        无条件的 UPDATE 会让同一笔佣金被两次计入可提现余额。
+        """
         with self._maybe_conn(conn) as c:
-            c.execute(
-                "UPDATE grab_commissions SET status = ?, released_at = ? WHERE id = ?",
-                (status, released_at, cid),
+            if expect is None:
+                c.execute(
+                    "UPDATE grab_commissions SET status = ?, released_at = ? WHERE id = ?",
+                    (status, released_at, cid),
+                )
+                return True
+            cur = c.execute(
+                "UPDATE grab_commissions SET status = ?, released_at = ? WHERE id = ? AND status = ?",
+                (status, released_at, cid, expect),
             )
+            return cur.rowcount > 0
 
     # ---------- 提现单 ----------
 

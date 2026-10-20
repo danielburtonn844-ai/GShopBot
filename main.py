@@ -45,9 +45,8 @@ from telegram.ext import (
     filters,
 )
 
-from examples.runtime import ADMIN_ID, BOT_TOKEN, VERSION, grab, service, stock
-from examples.handlers_command import cmd_admin, cmd_grabber, cmd_start, on_error
 from examples.handlers_callback import on_callback
+from examples.handlers_command import cmd_admin, cmd_grabber, cmd_start, on_error
 from examples.handlers_message import on_message
 from examples.jobs import (
     auto_backup,
@@ -56,6 +55,7 @@ from examples.jobs import (
     auto_grab_housekeeping,
     daily_report,
 )
+from examples.runtime import ADMIN_ID, BOT_TOKEN, VERSION, grab, service, stock
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -113,6 +113,18 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         logger.warning("机器人入群识别处理失败：%s", exc)
 
 
+# Telegram Bot API 的「默认更新集合」明确不含 chat_member（官方文档 getUpdates 一节：
+# 空 allowed_updates 表示除 chat_member / message_reaction / message_reaction_count 外的全部）。
+# 不显式订阅的话，ChatMemberHandler.CHAT_MEMBER 永远收不到事件，退群停权、
+# 专属入群链接校验、入群识别这些风控逻辑全部静默失效。这里显式列出所需类型。
+ALLOWED_UPDATES = [
+    Update.MESSAGE,         # 命令与私聊消息
+    Update.CALLBACK_QUERY,  # 按钮回调
+    Update.CHAT_MEMBER,     # 接单群成员变动（退群停权 / 邀请链接校验）
+    Update.MY_CHAT_MEMBER,  # 机器人自身被拉群 / 升为管理员
+]
+
+
 def main() -> None:
     if not BOT_TOKEN:
         logger.error("请在 .env 中设置 BOT_TOKEN")
@@ -140,7 +152,7 @@ def main() -> None:
     logger.info("🤖 G Shop Bot v%s 已启动（模块化版）", VERSION)
     logger.info("管理员 ID: %s", ADMIN_ID)
 
-    app.run_polling()
+    app.run_polling(allowed_updates=ALLOWED_UPDATES)
 
 
 if __name__ == "__main__":

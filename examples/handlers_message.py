@@ -18,12 +18,6 @@ from telegram import Update
 from telegram.ext import ContextTypes
 
 from .chain_watch import validate_chain_address
-from .richtext import rich_from_message
-from .runtime import db, grab, service, stock
-from .shop_service import BUY_FAIL_REASONS
-from .ui import audit, clear_state, h, kb, order_status_text, summarize_message
-from .pages_user import page_recharge_confirm, page_search_results
-from .pages_supply import page_supply_preview, page_admin_supply, page_admin_supply_cats, page_admin_supply_price
 from .pages_admin import (
     _GRAB_SETTING_ITEMS,
     page_admin_admins,
@@ -31,16 +25,20 @@ from .pages_admin import (
     page_admin_grab_settings,
     page_admin_grab_withdrawals,
     page_admin_grabber_detail,
-    page_admin_grabbers,
-    page_admin_order,
     page_admin_payment,
     page_admin_pcats,
     page_admin_pedit,
     page_admin_settings,
     page_admin_user_detail,
 )
-from .pages_grabber import page_grab_home, page_grab_withdraw
-from .pages_stock import restock_keyboard, restock_prompt
+from .pages_grabber import page_grab_withdraw
+from .pages_stock import restock_keyboard
+from .pages_supply import page_admin_supply, page_admin_supply_cats, page_admin_supply_price, page_supply_preview
+from .pages_user import page_recharge_confirm, page_search_results
+from .richtext import rich_from_message
+from .runtime import db, grab, service, stock
+from .shop_service import BUY_FAIL_REASONS
+from .ui import audit, clear_state, h, kb, order_status_text, summarize_message
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +53,6 @@ async def _album_commit_later(bot, chat_id: int, user_data: dict, pid: str, mgid
     buf = payload.get("album")
     if not buf or buf.get("mgid") != mgid or buf.get("version") != version:
         return  # 期间又有同组新图到达 / 已被其它路径（完成补货）flush
-    n_before = int(payload.get("added", 0) or 0)
     if stock.flush_album_buffer(payload, pid, admin_id):
         added = int(payload.get("added", 0) or 0)
         try:
