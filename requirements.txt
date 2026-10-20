@@ -1,0 +1,7 @@
+# 实际使用（业务代码真实 import 的依赖）
+python-telegram-bot>=21.0
+python-dotenv>=1.0.0
+httpx>=0.27.0
+# 以下为传递/备用依赖：业务代码未直接 import，保留无害（python-telegram-bot 内部会用到 httpx 栈）
+requests>=2.31.0
+urllib3>=2.0.0

@@ -1,0 +1,33 @@
+# ===== 密钥与配置 =====
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# ===== 数据库与运行时数据 =====
+data/
+backups/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.log
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+
+# ===== 编辑器 / 系统 =====
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
