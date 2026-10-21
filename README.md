@@ -148,7 +148,19 @@ venv/bin/python3 main.py
 
 > ⚠️ 一个 Bot Token 只能跑一个轮询实例，多开会导致 Telegram 报 `Conflict`。
 
-### 6. 部署为服务
+### 6. 发版后预热预览图（重要）
+
+GitHub 的 Release 页面用 `opengraph.githubassets.com` 生成卡片图，**懒生成**：第一次请求才渲染。分享得太早会抓到 404，Telegram 就会把这个链接缓存成「无图」，之后一直不显示缩略图。
+
+发完 Release 立刻跑一次预热：
+
+```bash
+python3 scripts/warm_og.py --tag v2.6.7
+```
+
+看到 `✓ 可以分享了` 再发链接。已经发出去且没图的，把链接发给 Telegram 官方的 **@WebpageBot** 可强制刷新缓存。
+
+### 7. 部署为服务
 
 ```ini
 # /etc/systemd/system/gshopbot.service
