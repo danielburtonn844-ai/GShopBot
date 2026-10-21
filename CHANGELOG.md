@@ -1,5 +1,96 @@
 # CHANGELOG — G Shop Bot
 
+## v2.6.4 · 2026-10-20 · 结构重构（数据层与回调分发拆分）
+
+纯重构，零行为变更。三个测试套件全绿，其中 7207 项业务断言一项未改即通过——这是「重构没改行为」的证明。
+
+### 数据层：2639 行 God Class → 12 个领域 mixin
+
+`examples/models.py` 原本是单个 `Database` 类，102 个方法、2639 行，所有 SQL 全堆在一起。
+
+现在拆成 `examples/db/` 包：
+
+| mixin | 领域 | 方法数 |
+|---|---|---|
+| `CoreMixin` | 连接 / 事务 / 建表 / 迁移 | 5 |
+| `UserMixin` | 用户 | 5 |
+| `ProductMixin` | 商品 | 5 |
+| `OrderMixin` | 订单 | 9 |
+| `RechargeMixin` | 充值单与链上防重 | 7 |
+| `AdminMixin` | 管理员 | 5 |
+| `ChannelMixin` | 频道 | 4 |
+| `SettingMixin` | 设置项 | 4 |
+| `PointMixin` | 积分流水与操作日志 | 5 |
+| `SupplyMixin` | 付费供需 | 6 |
+| `StockMixin` | 库存池与到货提醒 | 13 |
+| `GrabMixin` | 抢单派单 | 34 |
+
+`Database` 变成多重继承门面，自身不再定义任何业务方法（有测试断言这一点）。`examples/models.py` 退化成 12 行兼容层，**所有 `from .models import ...` 调用点零改动**。
+
+分组唯一依据是「表」：同一张表的读写落在同一个 mixin，跨表事务仍在 `core.atomic()` 里完成。显式 import（不用星号），每个 mixin 只导入自己用到的名字。
+
+### 回调分发：1919 行 if 链 → 4 个命名空间 dispatcher
+
+`handlers_callback.py` 原本是一个函数、152 个 `if data.startswith(...)`。
+
+现在按回调命名空间拆成 4 个模块，入口只剩 78 行：
+
+| 模块 | 命名空间 | 行数 |
+|---|---|---|
+| `cb_user.py` | `m:` `d:` `buy:` `cbuy:` `od:` `urge:` `redeliver:` `rsub:` `rc:` `rcpay:` `rcchk:` | 453 |
+| `cb_supply.py` | `sup:` `a:sup*`（供需大厅/发布向导/开关/审核） | 554 |
+| `cb_admin.py` | `padd_*` `a:*`（上架向导/商品/订单/用户/设置） | 644 |
+| `cb_grab.py` | `gb:` `a:g*`（抢单/接单员/提现/申诉） | 565 |
+
+分发方式是「顺序短路」：`_dispatch_xxx(...) -> bool`，返回 `True` 即命中，后续不再执行。分支逻辑逐字未改，只把裸 `return` 换成 `return True`。
+
+### 顺带把权限校验改成 fail-closed
+
+原实现的管理员校验是 `a:` 分支里的一行，位置在文件中部（原 695 行），而 `a:sup*`（供需管理，原 1173 行）排在它后面——原代码里两者顺序正确，校验有效。
+
+但这个正确性完全依赖「校验那行必须排在所有 `a:` 分支之前」这个隐式约定。拆成多模块后，`cb_supply` 在 `cb_admin` 之前执行，`a:sup*` 就绕过了校验——拆分过程中测试的 12 项越权断言立刻变红，正是这个原因。
+
+改成入口集中做 fail-closed 闸门，把隐式约定变成显式代码：
+
+```python
+if data.startswith("a:") and not db.is_admin(uid):
+    await send_or_edit(query, "❌ 无权限", kb([[("🏠 主菜单", "m:root")]]))
+    return
+```
+
+这样以后新增任何 `a:` 前缀分支、调整任何 dispatcher 顺序，都不可能漏检。回归测试的 12 项越权断言（`a:prod` / `a:fin` / `a:sup` …）全部通过。
+
+### 新增 test_extra.py（71 项）
+
+补主自检没走到的分支：
+
+- **UI 降级路径**：HTML 解析失败 → 纯文本重发；`Message is not modified` → 静默忽略
+- **供需定价**：`both` = 两价之和 - 优惠、优惠大于总价时仍 >= 1、频道腿不为负、渠道可用性随配置变化
+- **地址校验**：TRON 长度/前缀/校验和三类错误、TON 长度/前缀/校验和、未知链拒绝
+- **金额解析**：6 位小数、超大金额、非法输入、负数
+- **门面完整性**：`Database` 继承各 mixin、自身零业务方法、`models.*` 全部名字仍可导入
+
+### 验证
+
+```
+test_bot_full.py   → ✅ 7207 项通过，❌ 0 项（重构前后完全一致）
+verify_issues.py   → ✅ 43 项通过，❌ 0 项
+test_extra.py      → ✅ 71 项通过，❌ 0 项
+ruff check         → All checks passed!
+coverage           → 71%（CI 门槛 70%，低于则红）
+```
+
+### 规模对比
+
+| 项 | 重构前 | 重构后 |
+|---|---|---|
+| 最大文件 | `models.py` 2639 行 | `shop_service.py` 1202 行 |
+| 最大单函数 | `on_callback` 1919 行 | `_dispatch_admin` 644 行 |
+| `Database` 方法数 | 102（集中） | 102（分散在 12 个 mixin，每个 4~34） |
+| 函数返回注解覆盖 | 94% | 94%（拆出的新文件全 100%） |
+
+---
+
 ## v2.6.3 · 2026-10-20 · 尾数唯一性 + TON 协议对齐 + 补账通道
 
 第二批修复，issue #4 ~ #7。全部为「静默出错」型缺陷：不报错、不告警，钱错了也看不出来。

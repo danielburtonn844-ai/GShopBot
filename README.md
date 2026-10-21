@@ -4,7 +4,7 @@
 
 **Telegram 自助报单 + 积分商城 + 抢单派单机器人**
 
-版本 `v2.6.3` · Python 3.10+ · SQLite · python-telegram-bot 22.8
+版本 `v2.6.4` · Python 3.10+ · SQLite · python-telegram-bot 22.8
 
 [![CI](https://github.com/danielburtonn844-ai/GShopBot/actions/workflows/ci.yml/badge.svg)](https://github.com/danielburtonn844-ai/GShopBot/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
@@ -110,25 +110,30 @@ vim .env
 
 冷钱包地址、链 API Key、渠道开关、单笔限额 **不在 `.env`**，在管理面板「💳 支付设置」里在线配置，存数据库 `settings` 表。
 
-### 4. 跑自检（推荐）
+### 4. 跑测试
 
 ```bash
-python3 test_bot_full.py
+python3 test_bot_full.py    # 业务全链路自检，7207 项
+python3 verify_issues.py    # 缺陷回归，43 项
+python3 test_extra.py       # 分支补强，71 项
 ```
 
-看到 `✅ 通过 7200+ 项   ❌ 失败 0 项` 即可用。自检强制走 `SHOP_DB_PATH` 隔离，不会碰正式库，全程不需要联网（链上 API 走 mock）。
+全部离线运行（链上 API 走 mock，支付接口走 stub），强制走 `SHOP_DB_PATH` 隔离，不会碰正式库，也不需要联网。
 
-回归测试（覆盖三个已修复的资金/风控缺陷）：
+覆盖率：
 
 ```bash
-python3 verify_issues.py
+pip install coverage
+coverage run --source=examples,main test_bot_full.py
+coverage run -a --source=examples,main test_extra.py
+coverage report --skip-covered
 ```
 
 代码风格检查：
 
 ```bash
 pip install ruff
-ruff check main.py examples
+ruff check main.py examples verify_issues.py test_extra.py
 ```
 
 ### 5. 启动
@@ -181,17 +186,38 @@ systemctl enable --now gshopbot
 
 ## 项目结构
 
-单向依赖，无循环引用。
+单向依赖，无循环引用。数据层与回调分发已按领域拆分，单文件最大 1200 行。
 
 ```
 main.py                     唯一入口（装配 + 接单群成员监听），不要运行其他任何 .py
 examples/
+├── db/                     数据层（v2.6.4 从 2639 行 God Class 拆出）
+│   ├── base.py             常量与工具函数（时区 / 单号 / 格式化 / 状态字典）
+│   ├── schema.py           全部 dataclass（纯数据，无业务逻辑）
+│   ├── __init__.py         Database 门面 = 12 个 mixin 组合
+│   └── mixins/
+│       ├── core.py         连接 / 事务 / 建表 / 迁移
+│       ├── user.py         用户
+│       ├── product.py      商品
+│       ├── order.py        订单
+│       ├── recharge.py     充值单与链上防重
+│       ├── admin.py        管理员
+│       ├── channel.py      频道
+│       ├── setting.py      设置项
+│       ├── point.py        积分流水与操作日志
+│       ├── supply.py       付费供需
+│       ├── stock.py        库存池与到货提醒
+│       └── grab.py         抢单派单（接单员/佣金/提现/申诉）
+├── models.py               兼容层：转导出 db 包，所有 `from .models import ...` 照旧
+├── handlers_callback.py    回调总入口（78 行：建档 → 清状态 → 权限闸门 → 分发）
+├── cb_user.py              用户端：主菜单 / 商品 / 购买 / 订单 / 充值
+├── cb_supply.py            付费供需：大厅 / 发布向导 / 管理端开关与审核
+├── cb_admin.py             管理端：上架向导 / 商品 / 订单 / 用户 / 设置
+├── cb_grab.py              抢单派单：群内抢单 / 接单员 / 提现 / 申诉
 ├── runtime.py              运行时单例装配间（db / service / stock / supply / grab / VERSION）
 ├── ui.py                   键盘构造、HTML 转义、安全发送、输入状态管理
-├── models.py               数据层：所有 SQL 与自动迁移（SQLite WAL + 原子事务）
 ├── richtext.py             富文本 + 星耀高级会员表情库（A/B 两套 200+ 枚）
 ├── handlers_command.py     /start /admin /grabber、抢单深链落地页、全局错误兜底
-├── handlers_callback.py    所有按钮回调的唯一入口（含群内「立即抢单」按钮）
 ├── handlers_message.py     输入状态机 + 接单员回单 + 管理员引用回单 + 补货向导
 ├── pages_user.py           用户端页面
 ├── pages_supply.py         供需页面
@@ -208,9 +234,10 @@ examples/
 data/
 └── shop.db                 数据库（自动生成，已 gitignore）
 
-test_bot_full.py            自检脚本（7200+ 断言，全离线）
-verify_issues.py            回归测试（佣金竞态 / 链上分页 / 更新订阅 / 金额精度）
-.github/workflows/ci.yml    CI：ruff + 语法 + 自检 + 回归，Python 3.10/3.11/3.12
+test_bot_full.py            自检脚本（7207 断言，全离线）
+verify_issues.py            缺陷回归（43 断言：佣金竞态 / 链上分页 / 更新订阅 / 金额精度 / 尾数唯一性 / TON 协议 / 补账 / 退款快照）
+test_extra.py               分支补强（71 断言：UI 降级 / 供需定价 / 地址校验 / 门面完整性）
+.github/workflows/ci.yml    CI：ruff + 语法 + 三套测试 + 覆盖率门槛（Python 3.10/3.11/3.12）
 pyproject.toml              项目元数据 + ruff 规则
 ```
 
