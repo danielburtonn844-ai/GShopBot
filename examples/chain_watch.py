@@ -98,6 +98,36 @@ def validate_chain_address(chain: str, addr: str) -> bool:
         return is_valid_ton(addr)
     return False
 
+def ton_normalize_address(addr: str) -> str:
+    """把 TON 地址统一成 raw 格式 `workchain:HEX64`，用于跨格式比较。
+
+    TonCenter v3 的 jetton_transfers 里 `jetton_master` / `source` / `destination`
+    返回的都是 raw 格式（如 `0:B113A994...`），而项目常量用的是 friendly 格式
+    （如 `EQCxE6mU...`）。直接字符串比较永远不等，会把所有转账过滤掉。
+    friendly（36 字节 base64url，含 tag + workchain + hash + CRC16）与 raw 两种
+    输入都接受；无法识别时原样小写返回，交由调用方判定不相等。
+    """
+    s = (addr or "").strip()
+    if not s:
+        return ""
+    if ":" in s:
+        wc, _, h = s.partition(":")
+        try:
+            return f"{int(wc)}:{h.strip().upper()}"
+        except (TypeError, ValueError):
+            return s.lower()
+    pad = "=" * (-len(s) % 4)
+    try:
+        raw = base64.urlsafe_b64decode(s + pad)
+    except Exception:
+        return s.lower()
+    if len(raw) != 36:
+        return s.lower()
+    wc = raw[1]
+    if wc >= 128:  # 单字节有符号 workchain
+        wc -= 256
+    return f"{wc}:{raw[2:34].hex().upper()}"
+
 
 # ============================================================
 # 金额工具
@@ -239,9 +269,19 @@ async def fetch_ton_usdt_incoming(
     仅取官方 USDT Jetton Master，comment 作为 memo 返回（业务层用它匹配充值单号）。
     min_timestamp 为秒级起点（TonCenter 的 start_utime），用于增量扫描。
     网络/接口异常返回空列表（轮询任务下轮再试），绝不抛炸主循环。
+
+    与 TonCenter v3 实际协议的三个对齐点（早期实现全部不符，导致 TON 充值从不入账）：
+    1. 收币方参数是 `owner_address`（配合 direction=in），`destination_wallet` 不被识别，
+       会被静默忽略并返回任意地址的转账；
+    2. 响应里的 `jetton_master` 是 raw 格式（`0:B113A9...`），必须规范化后再与
+       friendly 常量比较，否则所有记录都被过滤；
+    3. 转账备注在 `decoded_forward_payload.comment`，不在顶层 `comment`。
+    另外 `transaction_aborted=true` 表示交易失败，不得入账。
     """
+    target_master = ton_normalize_address(USDT_TON_MASTER)
+    target_owner = ton_normalize_address(address)
     params: dict[str, str] = {
-        "destination_wallet": address,
+        "owner_address": address,
         "jetton_master": USDT_TON_MASTER,
         "direction": "in",
         "limit": str(max(1, min(limit, 100))),
@@ -262,20 +302,29 @@ async def fetch_ton_usdt_incoming(
     out: list[ChainTx] = []
     for item in payload.get("jetton_transfers") or []:
         try:
-            if item.get("jetton_master") != USDT_TON_MASTER:
-                continue
+            if ton_normalize_address(item.get("jetton_master") or "") != target_master:
+                continue  # 非官方 USDT，防假币
+            if item.get("transaction_aborted"):
+                continue  # 交易失败，链上没有实际转账
+            dest = ton_normalize_address(item.get("destination") or "")
+            if dest and target_owner and dest != target_owner:
+                continue  # 双保险：收款方必须是我们配置的地址
             txid = str(item.get("transaction_hash") or "")
             if not txid:
                 continue
             amount = parse_chain_amount(str(item.get("amount") or "0"))
             if amount <= 0:
                 continue
+            fwd = item.get("decoded_forward_payload") or {}
+            comment = str(fwd.get("comment") or "").strip()
+            if not comment:  # 兼容旧版本/未解码时的顶层字段
+                comment = str(item.get("comment") or "").strip()
             out.append(ChainTx(
                 txid=txid,
                 amount=amount,
                 sender=str(item.get("source") or ""),
                 timestamp=int(item.get("transaction_now") or 0),
-                memo=str(item.get("comment") or "").strip(),
+                memo=comment,
             ))
         except Exception as exc:
             logger.warning("TonCenter 单条解析失败：%s", exc)

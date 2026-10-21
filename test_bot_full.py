@@ -448,7 +448,7 @@ async def run():
     service.create_recharge_with_paylink = orig_paylink
 
     # 查询支付状态（mock 未支付）
-    async def fake_check(rid):
+    async def fake_check(rid, allow_failed=False):
         return False
     orig_check = service.check_recharge_status
     service.check_recharge_status = fake_check
@@ -1317,7 +1317,7 @@ async def run():
         conn.close()
     orig_chk = service.check_recharge_status
 
-    async def _fake_chk(rid):
+    async def _fake_chk(rid, allow_failed=False):
         return False
 
     service.check_recharge_status = _fake_chk  # 隔离平台单的真实网络请求

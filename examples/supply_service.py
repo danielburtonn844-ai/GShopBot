@@ -229,6 +229,9 @@ class SupplyService:
             return None, "no_channel"
         daily_limit = int(s.get("supply_daily_limit", 5))
         cost = self.price_for(channel)
+        # 频道腿金额快照：退款必须按「发帖时实付」而不是「退款时的当前价」，
+        # 否则管理员调价后分发失败会超额退款（原扣 1 分、调价后退 100 分）。
+        channel_leg = self.channel_leg_value(channel)
         if not s.get("supply_anonymous", True):
             anonymous = False
         status = "pending_review" if s.get("supply_review", False) else "active"
@@ -252,6 +255,7 @@ class SupplyService:
                 photo_file_id=photo_file_id or "",
                 channel=channel,
                 cost=cost,
+                channel_leg=channel_leg,
                 anonymous=anonymous,
                 status=status,
                 created_at=now_iso(),
@@ -421,8 +425,15 @@ class SupplyService:
             await self._refund_channel_leg(post, str(exc))
 
     async def _refund_channel_leg(self, post: SupplyPost, why: str) -> None:
-        """频道分发失败：退频道腿积分（幂等），并私信通知发布者。"""
-        amount = self.channel_leg_value(post.channel)
+        """频道分发失败：退频道腿积分（幂等），并私信通知发布者。
+
+        退款金额优先取 `post.channel_leg`（发帖时实付快照）。老数据该字段为 0，
+        回退到「按当前价格估算」的旧口径，且退款额不会超过该帖实付总额 `post.cost`，
+        杜绝调价后退款超过扣款。
+        """
+        amount = post.channel_leg or self.channel_leg_value(post.channel)
+        if post.cost > 0:
+            amount = min(amount, post.cost)
         if amount <= 0 or post.refunded:
             return
         with self.db.atomic() as conn:

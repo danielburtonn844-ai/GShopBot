@@ -1,5 +1,44 @@
 # CHANGELOG — G Shop Bot
 
+## v2.6.3 · 2026-10-20 · 尾数唯一性 + TON 协议对齐 + 补账通道
+
+第二批修复，issue #4 ~ #7。全部为「静默出错」型缺陷：不报错、不告警，钱错了也看不出来。
+
+### 修复
+
+- **[资金安全] 待支付单超过 200 笔时 TRON 尾数重复分配**
+  `_alloc_tron_suffix()` 从 `list_pending_recharges()` 取占用集合，而这个方法 `ORDER BY created_at DESC LIMIT 200`。待支付单超过 200 笔后，更早的单不在列表里，尾数被重复分配，两笔不同订单生成完全相同的应付金额（如都分配 `10.001`），付款会记到别人账上。
+  修法：新增 `pending_tron_suffixes(base_amount)` 按「同一整数金额」全表扫描（不同整数金额不可能误匹配，可安全复用尾数）；`_alloc_tron_suffix(base_amount, conn)` 接收金额与事务连接。
+  另一个并发缺陷：原实现「先分配、后插入」在写锁前互相看不见，两个并发请求会分到同一尾数。现把分配与落库放进同一个 `BEGIN IMMEDIATE` 事务。
+
+- **[充值] TON 解析与 TonCenter v3 实际协议不兼容**
+  三个独立错误叠加，导致 TON 充值**从来不会自动入账**：
+  1. 收币方参数写成 `destination_wallet`，官方是 `owner_address`（配 `direction=in`）。错参数被静默忽略，返回任意地址的转账。
+  2. 响应 `jetton_master` 是 raw 格式（`0:B113A9...`），代码拿 friendly 常量（`EQCxE6mU...`）直接比，**永不相等**，所有记录被过滤。
+  3. 备注在 `decoded_forward_payload.comment`，代码读顶层 `comment`，永远拿到空串。
+  修法：参数改 `owner_address`；新增 `ton_normalize_address()` 把 friendly/raw 统一成 `workchain:HEX64` 再比较；备注按 `decoded_forward_payload.comment` 优先、顶层 `comment` 兜底；额外检查 `transaction_aborted`（失败交易不入账）与 `destination`（双保险核对收款方）。
+
+- **[充值] 超时订单未查账即标失败，已付款订单永久丢失**
+  `check_all_pending_recharges()` 对超过 2 小时的单直接 `status = "failed"` 后跳过；`check_recharge_status()` 又只接受 `pending`。服务停机、支付接口故障、队列拥堵期间用户已付款的单，从此没有任何补账途径。
+  修法：标 failed 之前先查一次账，查到即入账；`check_recharge_status(..., allow_failed=True)` 允许 failed 单补记；管理员/用户点「查询支付状态」时传 `allow_failed=True`。
+
+- **[资金安全] 供需分发失败退款按当前价格，调价后可超额退款**
+  `_refund_channel_leg()` 用 `channel_leg_value(post.channel)` 实时算价。原扣 1 分、管理员把频道价调到 100 后分发失败，会退 100 分（余额 100 → 199）。
+  修法：`SupplyPost` 新增 `channel_leg` 字段，发帖时快照实付金额；退款优先取快照，老数据（0）回退旧口径，且 `min(amount, post.cost)` 硬性封顶，退款绝不超过实付总额。配套迁移：老库自动 `ALTER TABLE supply_posts ADD COLUMN channel_leg`。
+
+### 测试
+
+- `verify_issues.py` 从 21 项扩到 **43 项**，覆盖 #1 ~ #7 全部七个缺陷。每项都先断言「修复前的行为确实会出错」，再断言修复后正确——避免出现「测试通过但 bug 仍在」的假绿。
+- `test_bot_full.py` 两处 mock 补 `allow_failed` 参数，7207 项全绿。
+
+```
+python3 test_bot_full.py   → ✅ 7207 项通过，❌ 0 项
+python3 verify_issues.py   → ✅ 43 项通过，❌ 0 项
+ruff check                 → All checks passed!
+```
+
+---
+
 ## v2.6.2 · 2026-10-20 · 资金安全修复 + 工程化
 
 本次为缺陷修复与工程规范补强，不含新功能。三个资金/风控级缺陷来自公开 issue，全部附回归用例。

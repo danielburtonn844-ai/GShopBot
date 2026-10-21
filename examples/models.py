@@ -9,6 +9,7 @@ import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -530,6 +531,7 @@ class SupplyPost:
     photo_file_id: str = ""    # 可选，一张图
     channel: str = "bot"       # bot=机器人广播 / channel=频道 / both=双发
     cost: int = 0              # 本次实付积分
+    channel_leg: int = 0       # 发帖时「频道腿」实付快照（退款按此金额，不受事后调价影响）
     anonymous: bool = False    # 匿名发布（管理员后台仍可见真实身份）
     status: str = "active"     # active / pending_review / rejected / deleted
     bot_ok: bool = False       # 机器人广播是否已执行
@@ -550,6 +552,7 @@ class SupplyPost:
             "photo_file_id": self.photo_file_id,
             "channel": self.channel,
             "cost": self.cost,
+            "channel_leg": self.channel_leg,
             "anonymous": self.anonymous,
             "status": self.status,
             "bot_ok": self.bot_ok,
@@ -572,6 +575,7 @@ class SupplyPost:
             photo_file_id=data.get("photo_file_id", "") or "",
             channel=data.get("channel", "bot") or "bot",
             cost=data.get("cost", 0) or 0,
+            channel_leg=data.get("channel_leg", 0) or 0,
             anonymous=bool(data.get("anonymous", False)),
             status=data.get("status", "active") or "active",
             bot_ok=bool(data.get("bot_ok", False)),
@@ -1035,6 +1039,7 @@ class Database:
                     photo_file_id TEXT DEFAULT '',
                     channel TEXT DEFAULT 'bot',
                     cost INTEGER DEFAULT 0,
+                    channel_leg INTEGER DEFAULT 0,
                     anonymous INTEGER DEFAULT 0,
                     status TEXT DEFAULT 'active',
                     bot_ok INTEGER DEFAULT 0,
@@ -1154,6 +1159,13 @@ class Database:
             if sp_columns and "content_html" not in sp_columns:
                 logger.info("检测到旧 supply_posts 表结构，补充 content_html 列")
                 conn.execute("ALTER TABLE supply_posts ADD COLUMN content_html TEXT DEFAULT ''")
+                conn.commit()
+
+            # 迁移：老库 supply_posts 表补 channel_leg 列（v2.6.2 退款快照）。
+            # 老数据为 0，退款时自动回退到「按当前价格估算」的旧口径，不会因迁移而多退。
+            if sp_columns and "channel_leg" not in sp_columns:
+                logger.info("检测到旧 supply_posts 表结构，补充 channel_leg 列")
+                conn.execute("ALTER TABLE supply_posts ADD COLUMN channel_leg INTEGER DEFAULT 0")
                 conn.commit()
 
             # 迁移：老库 products 表补 category / delivery_mode 列（v2.4.0 商品分类与库存池，
@@ -1776,6 +1788,32 @@ class Database:
 
     def list_pending_recharges(self, limit: int = 200) -> list[Recharge]:
         return self.list_recharges(status="pending", limit=limit)
+
+    def pending_tron_suffixes(
+        self, base_amount: int, conn: sqlite3.Connection | None = None
+    ) -> set[int]:
+        """某个整数金额下，已被 pending 冷钱包单占用的 TRON 识别尾数（全量，不截断）。
+
+        尾数分配必须看全量：list_pending_recharges 有 limit=200，待支付单超过
+        200 笔时更早的单不再出现在列表里，尾数会被重复分配，导致两笔不同订单的
+        应付金额完全相同、付款记到别人账上。这里直接按金额分组全表扫描。
+        """
+        with self._maybe_conn(conn) as c:
+            rows = c.execute(
+                "SELECT expected_amount FROM recharges"
+                " WHERE status = 'pending' AND chain = 'trc20' AND expected_amount != ''"
+            ).fetchall()
+        used: set[int] = set()
+        for row in rows:
+            raw = str(row[0] or "")
+            try:
+                d = Decimal(raw)
+            except (InvalidOperation, ValueError):
+                continue
+            if int(d) != int(base_amount):
+                continue  # 整数金额不同 → 完整应付金额不同，不会互相误匹配
+            used.add(int((d % 1) * 1000))
+        return used
 
     # ---------- 链上交易防重（v2.5.0 冷钱包：同一 txid 绝不二次入账） ----------
 

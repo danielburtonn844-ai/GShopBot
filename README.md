@@ -4,7 +4,7 @@
 
 **Telegram 自助报单 + 积分商城 + 抢单派单机器人**
 
-版本 `v2.6.1` · Python 3.10+ · SQLite · python-telegram-bot 22.8
+版本 `v2.6.3` · Python 3.10+ · SQLite · python-telegram-bot 22.8
 
 [![CI](https://github.com/danielburtonn844-ai/GShopBot/actions/workflows/ci.yml/badge.svg)](https://github.com/danielburtonn844-ai/GShopBot/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
@@ -241,8 +241,12 @@ pyproject.toml              项目元数据 + ruff 规则
 | `run_polling()` 未指定 `allowed_updates` | `chat_member` 默认不投递，退群停权/专属链接风控静默失效 | 显式订阅 MESSAGE / CALLBACK_QUERY / CHAT_MEMBER / MY_CHAT_MEMBER |
 | 充值积分 `int(float(x) * rate)` | 尾数 0.29 / 0.57 / 0.58 时少算 1 积分 | 改 `int(Decimal(x) * Decimal(rate))` |
 | 提现 `round()` 银行家舍入 | 2.5 → 2，少付 0.5U | `Decimal.quantize(..., ROUND_HALF_UP)` |
+| 尾数分配依赖 `LIMIT 200` 列表 | 待支付单超 200 笔后尾数重复，付款记到别人账上 | 按整数金额全表扫描 + 分配与落库同事务 |
+| TON 解析与 TonCenter v3 不兼容 | `destination_wallet` 参数无效、friendly/raw 地址比不相等、备注读错字段 → TON 充值从不入账 | 改 `owner_address`；`ton_normalize_address()` 统一格式；读 `decoded_forward_payload.comment`；检查 `transaction_aborted` |
+| 超时单直接标 failed | 停机/接口故障期间已付款订单永久丢失 | 标 failed 前先查账；`allow_failed=True` 保留补记通道 |
+| 供需退款按当前价格 | 调价后分发失败超额退款（扣 1 退 100） | 发帖时快照 `channel_leg`，退款按快照且封顶实付总额 |
 
-以上全部有回归用例，`python3 verify_issues.py` 可复现验证。
+以上全部有回归用例，`python3 verify_issues.py` 可复现验证（43 项断言）。
 
 ---
 

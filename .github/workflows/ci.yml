@@ -29,7 +29,7 @@ jobs:
       - name: Lint (ruff)
         run: |
           pip install ruff
-          ruff check main.py examples
+          ruff check main.py examples verify_issues.py
 
       - name: Syntax check
         run: python -m compileall -q main.py examples verify_issues.py

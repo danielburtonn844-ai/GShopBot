@@ -462,7 +462,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             else:
                 text = "⏳ 暂未检测到链上到账，请确认金额/备注无误后再查询（链上确认约 1~3 分钟）"
         else:
-            paid = await service.check_recharge_status(rid)
+            # allow_failed=True：超时被标 failed 的单也要能补查，
+            # 否则停机期间已付款的订单永久丢失
+            paid = await service.check_recharge_status(rid, allow_failed=True)
             if paid:
                 recharge = db.get_recharge(rid)
                 if recharge:

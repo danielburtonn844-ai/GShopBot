@@ -494,11 +494,16 @@ class ShopService:
             self.db.save_recharge(recharge)
             return recharge, None
 
-    async def check_recharge_status(self, recharge_id: str) -> bool:
+    async def check_recharge_status(self, recharge_id: str, allow_failed: bool = False) -> bool:
         """按充值单记录的渠道（OkPay/KKPay）向对应平台 checkDeposit 查询是否到账。
-        到账则在一个事务里「标记充值完成 + 给用户加积分 + 记流水」，返回 True。"""
+        到账则在一个事务里「标记充值完成 + 给用户加积分 + 记流水」，返回 True。
+
+        allow_failed=True 时也接受 failed 状态的单——超时被标失败的订单可能其实
+        已经付过款（服务停机、支付接口故障期间），必须保留补账途径。
+        """
         recharge = self.db.get_recharge(recharge_id)
-        if not recharge or recharge.status != "pending":
+        ok_states = ("pending", "failed") if allow_failed else ("pending",)
+        if not recharge or recharge.status not in ok_states:
             return False
         if recharge.chain:
             return False  # 冷钱包单由 check_chain_recharges 链上匹配，不查支付平台
@@ -510,7 +515,7 @@ class ShopService:
                 return False
             with self.db.atomic() as conn:
                 fresh = self.db.get_recharge(recharge_id, conn=conn)
-                if not fresh or fresh.status != "pending":
+                if not fresh or fresh.status not in ok_states:
                     return False  # 并发下已被处理，防重复入账
                 fresh.status = "completed"
                 fresh.paid_at = now_iso()
@@ -556,18 +561,15 @@ class ShopService:
 
     # ---------- 冷钱包充值（v2.5.0：TRON 尾数识别 / TON 备注识别） ----------
 
-    def _alloc_tron_suffix(self) -> int | None:
+    def _alloc_tron_suffix(self, base_amount: int, conn: Any = None) -> int | None:
         """分配一个当前未被占用的 TRON 识别尾数（1~999 的整数，表示 0.001~0.999）。
-        占用 = 存在同尾数的 pending 冷钱包单。尾数池占满返回 None（999 单并发才可能，兜底拒绝）。"""
-        used: set[int] = set()
-        for r in self.db.list_pending_recharges():
-            if r.chain != "trc20" or not r.expected_amount:
-                continue
-            try:
-                frac = Decimal(r.expected_amount) % 1
-                used.add(int(frac * 1000))
-            except Exception:
-                continue
+
+        占用判定按「同一整数金额」全量统计（不截断），因为只有整数部分相同的两笔单
+        才可能生成完全相同的应付金额、进而互相误匹配。尾数池 999 个，
+        同金额并发 999 单才可能占满，占满返回 None（兜底拒绝下单）。
+        传入 conn 时复用调用方事务，保证「分配 + 落库」原子，并发下不会双分配。
+        """
+        used = self.db.pending_tron_suffixes(base_amount, conn=conn)
         free = [s for s in range(1, 1000) if s not in used]
         if not free:
             return None
@@ -599,38 +601,44 @@ class ShopService:
             return None
 
         rate = settings.get("points_rate", 10)
-        expected_str = ""
-        pay_amount = amount
-        # 积分换算基准全程 Decimal：float 在 0.29/0.57/0.58 这类尾数上会少算 1 积分
-        # （如 float("10.29")*100 == 1028.9999999999998 → int() 得 1028，正确值 1029）
-        points_base = Decimal(str(amount))
-        if chain == "trc20":
-            suffix = self._alloc_tron_suffix()
-            if suffix is None:
-                logger.warning("TRON 尾数池已占满，拒绝新单：user=%s amount=%s", user_id, amount)
-                return None
-            expected = Decimal(int(amount)) + Decimal(suffix) / Decimal(1000)
-            expected_str = dec_to_str(expected)
-            pay_amount = float(expected_str)  # amount 字段为 REAL，展示一律走 expected_str
-            points_base = expected            # 积分按实际应付（含尾数）换算
-
+        base_amount = int(Decimal(str(amount)))
         user = self.db.get_user(user_id)
-        recharge = Recharge(
-            id=gen_recharge_id(),
-            user_id=user_id,
-            username=user.username if user else "",
-            amount=pay_amount,
-            points=int(points_base * Decimal(str(rate))),  # 规格：向下取整（Decimal 精确）
-            status="pending",
-            created_at=now_iso(),
-            gateway=chain,
-            chain=chain,
-            expected_amount=expected_str,
-            memo="",
-        )
-        if chain == "ton":
-            recharge.memo = recharge.id  # TON 用转账备注匹配单号
-        self.db.save_recharge(recharge)
+
+        # 「分配尾数 + 落库」放进同一个 BEGIN IMMEDIATE 事务：
+        # 两个并发下单若各自先分配再插入，会分到同一尾数（写锁前互相看不见），
+        # 事务串行化后第二个请求必然看到第一个已落库的占用。
+        with self.db.atomic() as conn:
+            expected_str = ""
+            pay_amount = amount
+            # 积分换算基准全程 Decimal：float 在 0.29/0.57/0.58 这类尾数上会少算 1 积分
+            # （如 float("10.29")*100 == 1028.9999999999998 → int() 得 1028，正确值 1029）
+            points_base = Decimal(str(amount))
+            if chain == "trc20":
+                suffix = self._alloc_tron_suffix(base_amount, conn=conn)
+                if suffix is None:
+                    logger.warning("TRON 尾数池已占满，拒绝新单：user=%s amount=%s", user_id, amount)
+                    return None
+                expected = Decimal(base_amount) + Decimal(suffix) / Decimal(1000)
+                expected_str = dec_to_str(expected)
+                pay_amount = float(expected_str)  # amount 字段为 REAL，展示一律走 expected_str
+                points_base = expected            # 积分按实际应付（含尾数）换算
+
+            recharge = Recharge(
+                id=gen_recharge_id(),
+                user_id=user_id,
+                username=user.username if user else "",
+                amount=pay_amount,
+                points=int(points_base * Decimal(str(rate))),  # 规格：向下取整（Decimal 精确）
+                status="pending",
+                created_at=now_iso(),
+                gateway=chain,
+                chain=chain,
+                expected_amount=expected_str,
+                memo="",
+            )
+            if chain == "ton":
+                recharge.memo = recharge.id  # TON 用转账备注匹配单号
+            self.db.save_recharge(recharge, conn=conn)
         return recharge
 
     # ---------- 链上扫描游标 ----------
@@ -967,7 +975,18 @@ class ShopService:
             except Exception:
                 continue
             if created < cutoff:
-                # 超过 max_age_hours 未支付的标记为失败，不再轮询（冷钱包单同样过期）
+                # 过期前必须先查一次账：服务停机 / 支付接口故障 / 队列拥堵期间
+                # 用户可能已经付款，直接标 failed 会让已付款订单永远无法自动补记。
+                if not r.chain:
+                    try:
+                        if await self.check_recharge_status(r.id):
+                            fresh = self.db.get_recharge(r.id)
+                            if fresh:
+                                paid_list.append(fresh)
+                            continue
+                    except Exception as exc:
+                        logger.warning("过期单补查失败 %s：%s", r.id, exc)
+                # 超过 max_age_hours 且确实未支付 → 标记失败，不再轮询（冷钱包单同样过期）
                 r.status = "failed"
                 self.db.save_recharge(r)
                 continue
