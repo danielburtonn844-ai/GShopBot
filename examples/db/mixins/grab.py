@@ -253,6 +253,34 @@ class GrabMixin:
                 "processed_by": w.processed_by, "processed_at": w.processed_at,
             })
 
+    def set_withdrawal_status(
+        self,
+        wid: str,
+        status: str,
+        txid: str = "",
+        admin_id: int = 0,
+        conn: sqlite3.Connection | None = None,
+        expect: str | None = None,
+    ) -> bool:
+        """更新提现单状态；expect 非空时做 CAS（只有当前状态匹配才更新）。
+
+        审核「通过」必须走 CAS：另一个管理员同时点「拒绝」时，拒绝方会退回余额，
+        若通过方无条件覆盖成 paid，用户就既拿到打款又拿回积分。
+        """
+        with self._maybe_conn(conn) as c:
+            if expect is None:
+                c.execute(
+                    "UPDATE withdrawals SET status=?, txid=?, processed_by=?, processed_at=? WHERE id=?",
+                    (status, txid, admin_id, now_iso(), wid),
+                )
+                return True
+            cur = c.execute(
+                "UPDATE withdrawals SET status=?, txid=?, processed_by=?, processed_at=?"
+                " WHERE id=? AND status=?",
+                (status, txid, admin_id, now_iso(), wid, expect),
+            )
+            return cur.rowcount > 0
+
     def list_withdrawals(
         self, status: str = "", grabber_id: int = 0, limit: int = 20, offset: int = 0
     ) -> list[Withdrawal]:

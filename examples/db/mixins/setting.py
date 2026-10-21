@@ -55,7 +55,11 @@ class SettingMixin:
             "trongrid_api_key": self.get_setting("trongrid_api_key", ""),
             "toncenter_api_key": self.get_setting("toncenter_api_key", ""),
             "maintenance_mode": self.get_setting("maintenance_mode", False),
-            "order_expire_minutes": self.get_setting("order_expire_minutes", 30),
+            # 注意：order_expire_minutes 已移除（v2.6.6）。它只在这里定义了默认值，
+            # 全项目没有任何代码读取，界面上也没有对应开关，属于「僵尸设置项」——
+            # 留着会让后人以为存在订单超时自动取消功能。订单状态目前只由
+            # 管理员手动流转，充值单过期由 check_all_pending_recharges 的
+            # max_age_hours 处理，两者不要混为一谈。
             "force_channels": self.get_setting("force_channels", False),
             # ---------- 付费供需 ----------
             "supply_price_bot": self.get_setting("supply_price_bot", 10),

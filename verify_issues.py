@@ -479,6 +479,32 @@ def test_issue7() -> None:
           f"实际 {after2.points}（应为 106）")
 
 
+# ==================================================================
+# 附加：普通充值入口（OkPay/KKPay）的积分精度
+# ==================================================================
+def test_recharge_points() -> None:
+    print("\n=== 普通充值入口积分精度 ===")
+    tmp = tempfile.mkdtemp()
+    os.environ["SHOP_DB_PATH"] = os.path.join(tmp, "t8.db")
+
+    from examples.db import Database
+    from examples.shop_service import ShopService
+
+    db = Database(os.environ["SHOP_DB_PATH"])
+    svc = ShopService(db, None)
+    db.set_setting("min_recharge_usdt", 0.001)
+    db.set_setting("max_recharge_usdt", 1000)
+
+    # float(x)*rate 与实际正确值的差异组合（0.29/0.57/0.58 @ 100、0.58 @ 50）
+    cases = [("0.29", 100, 29), ("0.57", 100, 57), ("0.58", 100, 58), ("0.58", 50, 29)]
+    for amount_s, rate, expect in cases:
+        db.set_setting("points_rate", rate)
+        rc = svc.create_recharge(90001, float(amount_s))
+        check(f"{amount_s} USDT @ {rate} 积分/U = {expect} 积分",
+              rc is not None and rc.points == expect,
+              f"实际 {rc.points if rc else 'None'}（float 会得 {int(float(amount_s) * rate)}）")
+
+
 if __name__ == "__main__":
     test_issue1()
     test_issue2()
@@ -488,6 +514,7 @@ if __name__ == "__main__":
     test_issue6()
     test_issue7()
     test_money()
+    test_recharge_points()
     print(f"\n{'=' * 50}")
     print(f"✅ 通过 {PASS} 项   ❌ 失败 {FAIL} 项")
     print("=" * 50)

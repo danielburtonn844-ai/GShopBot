@@ -1,5 +1,86 @@
 # CHANGELOG — G Shop Bot
 
+## v2.6.6 · 2026-10-21 · 欢迎图常驻 + 五个静默缺陷
+
+### 功能：主界面欢迎图不再消失（参照扎堆号铺的媒体感知更新）
+
+**问题复现**：`/start` 发的是带欢迎图的图文消息 → 点任意按钮进子页 → 图被 `edit_message_text` 抹成纯文字 → 再点「主菜单」返回，走的仍是无图分支，**图彻底回不来**。
+
+**根因**：`send_or_edit(query, text, kb)` 只有「有图 → 发新消息」和「无图 → 改文字」两条路，而 Tele­gram 的 `editMessageText` 不能保留图片，`editMessageCaption` 不会在纯文字消息上创建图片。
+
+**修法**（对齐扎堆号铺的 `send_or_edit` 设计）：把「当前消息承载什么媒体」纳入决策。
+
+| 当前消息 | 目标 | 处理方式 |
+|---|---|---|
+| 图文 | 同一张图 | `edit_message_caption` 就地改图注，图不丢、不删消息 |
+| 图文 | 另一张图 | `edit_message_media` 原地换图 |
+| 图文 | 无图 | 删旧消息 → 发纯文字 |
+| 文字 | 有图 | 删旧消息 → 发图文（Telegram 不支持文→图就地转换） |
+| 文字 | 无图 | `edit_message_text` 就地改 |
+
+配套：
+- 新增 `pages_user.home_photo()`，`m:root` / `m:checkjoin` / 未知回调兜底三处回主界面都带它
+- 文案超过 1024 字符（caption 上限）时主动放弃带图，退回纯文字，避免编辑失败整页打不开
+- HTML 解析失败 / `Message is not modified` 的安全降级全部保留
+
+### 修复
+
+- **[充值] 普通充值入口（OkPay/KKPay）积分精度**
+  `points = int(amount * rate)` 走 float。`0.29 USDT @ 100 积分/U` 得 28（应为 29）、`0.57` 得 56、`0.58` 得 57。v2.6.2 只修了冷钱包入口，这个主入口漏了。
+  修法：`int(Decimal(str(amount)) * Decimal(str(rate)))`。
+
+- **[充值] 充值确认页与实付不一致**
+  `page_recharge_confirm` 同样用 `int(amount * rate)` 预览。页面上写「获得 100 积分」、实际入账 99，是最容易招投诉的一类不一致。
+  修法：与 `create_recharge` 用同一套 Decimal 算法。
+
+- **[资金安全] 提现审核「通过」缺少事务与 CAS**
+  `approve_withdrawal` 是「读 → 判断 status == pending → 写」，三步不在事务内。两个管理员同时点「通过」和「拒绝」时，拒绝方在事务里退回余额，通过方随后无条件覆盖成 `paid`——用户既拿到打款又拿回积分。
+  修法：`atomic()` + 新增 `set_withdrawal_status(expect="pending")` 做 CAS。
+
+- **[订单] 管理员回单未放事务**
+  `complete_order` 同样是读-改-写三分离，双击或两个管理员同时点会各写一次，用户收到两条回单通知。
+  修法：整体放进 `atomic()`。
+
+- **[后台] 自动备份开关无效**
+  `auto_backup()` 从未读取 `daily_backup_enabled`，管理员在面板关掉后照样每天 04:30 备份。
+  修法：循环内先判开关。
+
+- **[广播] 用户超过 1 万时静默漏人**
+  商品广播与供需广播都用 `list_users(limit=10000)`，第 10001 个之后的用户永远收不到，且没有任何报错。
+  修法：新增 `db.iter_users(batch=500)` 分批遍历，内存占用也更低。
+
+- **[补货] 按 username 找人只查前 500 个用户**
+  `for u in db.list_users(limit=500)` 线性比对，用户超 500 后新用户永远找不到。
+  修法：新增 `get_user_by_username()` 走 SQL 精确查询。
+
+- **[统计] 订单管理页总数显示错误**
+  `len(orders)` 是 `LIMIT 200` 截断后的长度，超过 200 单时显示「共 200 条」。
+  修法：改用 `count_orders()` 真实计数。
+
+- **[设置] 移除僵尸设置项 `order_expire_minutes`**
+  只在 `get_settings()` 里定义了默认值 30，全项目没有任何代码读取，界面上也没有开关。留着会让后人以为存在「订单超时自动取消」功能。
+
+### 性能
+
+- **强制关注检查加 60 秒缓存**
+  每点一次主菜单都要对所有强制频道调一次 `get_chat_member`（一次网络往返），配 3 个频道就是 3 次 API 调用。加 `(user_id, 频道ID元组)` → 结果的 TTL 缓存，频道变化时 key 自动失效。
+
+### 测试
+
+- `test_extra.py` 从 71 项扩到 **85 项**，新增 14 项专门验证欢迎图的六种媒体切换路径
+- `verify_issues.py` 从 43 项扩到 **47 项**，新增普通充值入口 4 种精度组合
+- 覆盖率 76% → **75%**（新增代码拉低，绝对行数从 0 到覆盖）
+
+```
+test_bot_full.py        → ✅ 7207 项
+verify_issues.py        → ✅ 47 项
+test_extra.py           → ✅ 85 项
+test_coverage_boost.py  → ✅ 75 项
+ruff check              → All checks passed
+```
+
+---
+
 ## v2.6.5 · 2026-10-21 · 覆盖率补强 + 一个真实缺陷
 
 ### 修复

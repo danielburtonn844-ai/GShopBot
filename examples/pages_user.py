@@ -6,6 +6,8 @@ v2.4.0 新增：商品分类筛选、商品搜索、库存池实时余量与「�
 
 from __future__ import annotations
 
+from decimal import Decimal
+
 from telegram import InlineKeyboardMarkup
 
 from .models import PRODUCT_KINDS, STOCK_TYPES, Recharge, fmt_time
@@ -20,6 +22,15 @@ def _stock_line_for(p) -> str:
         n = db.count_stock_items(p.id, "available")
         return f"仅剩 {n} 件" if n <= 10 else f"现货 {n} 件"
     return "∞" if p.stock == -1 else str(p.stock)
+
+
+def home_photo() -> str:
+    """主页欢迎图 file_id（未设置返回空串）。
+
+    所有「回到主界面」的入口都必须带它，否则 send_or_edit 走纯文字分支，
+    会把原本的图文消息改成纯文字，欢迎图就此消失。
+    """
+    return str(db.get_settings().get("welcome_image", "") or "")
 
 
 def page_root(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
@@ -278,7 +289,9 @@ def page_recharge(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
 def page_recharge_confirm(amount: float) -> tuple[str, InlineKeyboardMarkup]:
     settings = db.get_settings()
     rate = settings.get("points_rate", 10)
-    points = int(amount * rate)
+    # 必须与 create_recharge 用同一套 Decimal 算法：页面上写「获得 100 积分」、
+    # 实际入账 99，是最容易招投诉的一类不一致（float 下 0.29*100 = 28.999...）
+    points = int(Decimal(str(amount)) * Decimal(str(rate)))
     amount_text = f"{amount:g}"
 
     lines = [

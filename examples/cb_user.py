@@ -14,6 +14,7 @@ from .pages_admin import (
     page_admin,
 )
 from .pages_user import (
+    home_photo,
     page_balance,
     page_buy_confirm,
     page_chain_pay,
@@ -58,9 +59,11 @@ async def _dispatch_user(
         ok, missing = await service.check_user_channels(uid)
         if not ok:
             text, keyboard = page_force_join(missing)
+            await send_or_edit(query, text, keyboard)
         else:
             text, keyboard = page_root(uid)
-        await send_or_edit(query, text, keyboard)
+            # 回主界面必须带欢迎图：不带的话 send_or_edit 会把图文消息改成纯文字
+            await send_or_edit(query, text, keyboard, photo=home_photo() or None)
         return True
 
     if data == "m:checkjoin":
@@ -70,7 +73,7 @@ async def _dispatch_user(
             await send_or_edit(query, "❌ 还未全部加入\n\n" + text, keyboard)
         else:
             text, keyboard = page_root(uid)
-            await send_or_edit(query, text, keyboard)
+            await send_or_edit(query, text, keyboard, photo=home_photo() or None)
         return True
 
     if data == "m:shop" or data.startswith("m:shop:"):

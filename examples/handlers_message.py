@@ -278,12 +278,9 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         if target.isdigit():
             target_id = int(target)
         else:
-            # 尝试按 username 在用户表里找
-            conn_row = None
-            for u in db.list_users(limit=500):
-                if (u.username or "").lower() == target.lower():
-                    conn_row = u
-                    break
+            # 按 username 精确反查（SQL 索引查询，不受用户总量影响；
+            # 原实现取前 500 用户线性比对，用户超 500 后新用户永远找不到）
+            conn_row = db.get_user_by_username(target)
             if conn_row:
                 target_id = conn_row.user_id
         if not target_id:

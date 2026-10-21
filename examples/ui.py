@@ -5,12 +5,16 @@
 
 from __future__ import annotations
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.error import BadRequest
 
 from .models import PRODUCT_STATUS, TAGS, escape_html
 from .richtext import clean_label, is_not_modified, match_icon, strip_html_tags
 from .runtime import db
+
+# Telegram 图片说明（caption）上限 1024 字符。超出时改用纯文字消息，
+# 避免「带图 + 超长正文」直接编辑失败导致整页打不开。
+CAPTION_LIMIT = 1024
 
 # ---------- 自定义 Emoji 图标（高级会员表情按钮左侧图标） ----------
 # 图标库在 examples/richtext.py，按钮经 kb() 统一自动匹配图标；正文内联表情用 TG_*。
@@ -77,50 +81,166 @@ def summarize_message(message) -> str:
     return text or kind or "（空消息）"
 
 
-async def send_or_edit(query, text: str, keyboard: InlineKeyboardMarkup, photo: str | None = None) -> None:
-    """有图发新消息，无图优先编辑原消息。
-
-    v2.3.0 起带安全降级：HTML 解析失败（如正文含高级会员表情但机器人权限失效、
-    老数据残留特殊字符）时自动降级为纯文本重发，保证页面一定能打开；
-    「Message is not modified」（重复点击同一页）直接忽略，不再刷重复消息。
-    """
+def _media_of(message) -> str:
+    """消息当前承载的媒体 file_id（图片/文件/视频），无媒体返回空串。"""
+    photo = getattr(message, "photo", None)
     if photo:
-        try:
-            await query.message.reply_photo(photo=photo, caption=text, reply_markup=keyboard, parse_mode="HTML")
-            return
-        except BadRequest:
-            try:
-                await query.message.reply_photo(
-                    photo=photo, caption=strip_html_tags(text), reply_markup=keyboard,
-                )
-                return
-            except Exception:
-                pass
-        except Exception:
-            pass
+        return photo[-1].file_id
+    for attr in ("document", "video", "animation", "audio", "voice"):
+        media = getattr(message, attr, None)
+        fid = getattr(media, "file_id", "") if media else ""
+        if fid:
+            return fid
+    return ""
+
+
+def _caption_fits(text: str) -> bool:
+    """文案是否放得进图片说明。超长时改用纯文字消息，避免编辑失败导致丢图。"""
+    return len(text or "") <= CAPTION_LIMIT
+
+
+async def _drop_message(message) -> None:
+    """删除上一条消息（失败忽略）。
+
+    Telegram 不支持把「图片消息」就地变成「文字消息」（反之亦然），
+    这类切换只能删旧发新，否则界面会残留过期消息、越堆越多。
+    """
     try:
-        await query.edit_message_text(text=text, reply_markup=keyboard, parse_mode="HTML")
+        await message.delete()
+    except Exception:
+        pass
+
+
+async def _edit_text(message, text: str, keyboard) -> bool:
+    """就地改文字；HTML 非法时降级纯文本。返回是否成功。"""
+    try:
+        await message.edit_message_text(text=text, reply_markup=keyboard, parse_mode="HTML")
+        return True
     except BadRequest as exc:
         if is_not_modified(exc):
-            return
-        plain = strip_html_tags(text)
+            return True
         try:
-            await query.edit_message_text(text=plain, reply_markup=keyboard)
+            await message.edit_message_text(text=strip_html_tags(text), reply_markup=keyboard)
+            return True
         except Exception:
-            try:
-                await query.message.reply_text(text=plain, reply_markup=keyboard)
-            except Exception:
-                pass
+            return False
     except Exception:
+        return False
+
+
+async def _edit_caption(message, text: str, keyboard) -> bool:
+    """就地改图注（保留图片）；HTML 非法时降级纯文本。返回是否成功。"""
+    try:
+        await message.edit_message_caption(caption=text, reply_markup=keyboard, parse_mode="HTML")
+        return True
+    except BadRequest as exc:
+        if is_not_modified(exc):
+            return True
         try:
-            await query.message.reply_text(text=text, reply_markup=keyboard, parse_mode="HTML")
-        except BadRequest:
-            try:
-                await query.message.reply_text(text=strip_html_tags(text), reply_markup=keyboard)
-            except Exception:
-                pass
+            await message.edit_message_caption(caption=strip_html_tags(text), reply_markup=keyboard)
+            return True
+        except Exception:
+            return False
+    except Exception:
+        return False
+
+
+async def _edit_media(message, photo: str, text: str, keyboard) -> bool:
+    """原地换图并改图注（图 → 图，不删消息、不闪烁）。返回是否成功。"""
+    try:
+        await message.edit_message_media(
+            media=InputMediaPhoto(media=photo, caption=text, parse_mode="HTML"),
+            reply_markup=keyboard,
+        )
+        return True
+    except BadRequest as exc:
+        if is_not_modified(exc):
+            return True
+        try:
+            await message.edit_message_media(
+                media=InputMediaPhoto(media=photo, caption=strip_html_tags(text)),
+                reply_markup=keyboard,
+            )
+            return True
+        except Exception:
+            return False
+    except Exception:
+        return False
+
+
+async def _reply_photo(message, photo: str, text: str, keyboard) -> bool:
+    """发送一条图文消息；HTML 非法或 file_id 失效时返回 False 由调用方兜底。"""
+    try:
+        await message.reply_photo(photo=photo, caption=text, reply_markup=keyboard, parse_mode="HTML")
+        return True
+    except BadRequest:
+        try:
+            await message.reply_photo(photo=photo, caption=strip_html_tags(text), reply_markup=keyboard)
+            return True
+        except Exception:
+            return False
+    except Exception:
+        return False
+
+
+async def _reply_text(message, text: str, keyboard) -> None:
+    """发送一条纯文字消息；HTML 非法时降级纯文本。"""
+    try:
+        await message.reply_text(text=text, reply_markup=keyboard, parse_mode="HTML")
+    except BadRequest:
+        try:
+            await message.reply_text(text=strip_html_tags(text), reply_markup=keyboard)
         except Exception:
             pass
+    except Exception:
+        pass
+
+
+async def send_or_edit(query, text: str, keyboard: InlineKeyboardMarkup, photo: str | None = None) -> None:
+    """媒体感知的「就地更新」，保证界面上始终只有一条当前页消息。
+
+    - 图文消息 → 改图注（欢迎图 / 商品图原地保留，不再新发消息）
+    - 文字消息 → 改文字
+    - 图 ↔ 文 互切（Telegram 不支持就地转换）→ 删旧发新，避免消息堆积
+
+    v2.3.0 的安全降级保留：HTML 解析失败（高级会员表情权限失效、老数据残留
+    特殊字符）自动降级纯文本重发；「Message is not modified」直接忽略。
+
+    v2.6.6 起主菜单回退时带 photo，解决「点进子页再返回，欢迎图消失」：
+    原实现无图一律走 edit_message_text，会把带图消息的图抹掉。
+    """
+    message = getattr(query, "message", None)
+    if message is None:
+        return
+    if photo and not _caption_fits(text):
+        # 图注放不下：退回纯文字，保证内容完整可见
+        photo = None
+    current = _media_of(message)
+
+    if photo:
+        if current:
+            # 当前已是图文消息：同图改图注，异图原地换图，都不删消息
+            if current == photo:
+                if await _edit_caption(message, text, keyboard):
+                    return
+            elif await _edit_media(message, photo, text, keyboard):
+                return
+        # 当前是文字消息（或就地编辑失败）：Telegram 无法把文字消息变成媒体消息，
+        # 只能删旧发新，否则界面会同时留下「没图的旧消息」和「带图的新消息」
+        await _drop_message(message)
+        if await _reply_photo(message, photo, text, keyboard):
+            return
+        await _reply_text(message, text, keyboard)
+        return
+
+    # 目标不带图：当前是图文消息则删旧发新，否则就地改文字
+    if current:
+        await _drop_message(message)
+        await _reply_text(message, text, keyboard)
+        return
+    if await _edit_text(message, text, keyboard):
+        return
+    await _reply_text(message, text, keyboard)
 
 
 async def reply_html(message, text: str, keyboard: InlineKeyboardMarkup | None = None, photo: str = "") -> None:

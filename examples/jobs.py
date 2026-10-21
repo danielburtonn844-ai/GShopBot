@@ -193,10 +193,16 @@ def do_backup() -> str:
 
 
 async def auto_backup() -> None:
-    """每天 04:30 自动备份数据库。"""
+    """每天 04:30 自动备份数据库（可在系统设置里关闭）。
+
+    原实现没有读 `daily_backup_enabled`，管理员在面板上关掉自动备份后
+    它照样每天跑——设置项形同虚设。
+    """
     while True:
         await asyncio.sleep(_seconds_until(4, 30))
         try:
+            if not db.get_settings().get("daily_backup_enabled", True):
+                continue
             dest = do_backup()
             logger.info("自动备份完成：%s", dest)
         except Exception as exc:

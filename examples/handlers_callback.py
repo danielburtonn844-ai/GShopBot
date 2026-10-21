@@ -72,8 +72,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     # 未知回调兜底：回主菜单，不静默失败
     logger.warning("未处理的回调: %s", data)
-    from .pages_user import page_root
+    from .pages_user import home_photo, page_root
     from .ui import send_or_edit
 
     text, keyboard = page_root(uid)
-    await send_or_edit(query, text, keyboard)
+    await send_or_edit(query, text, keyboard, photo=home_photo() or None)

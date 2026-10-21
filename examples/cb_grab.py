@@ -29,9 +29,6 @@ from .pages_grabber import (
     page_grab_rank,
     page_grab_withdraw,
 )
-from .pages_user import (
-    page_root,
-)
 from .runtime import db, grab
 from .ui import audit, h, kb, send_or_edit
 
@@ -506,7 +503,6 @@ async def _dispatch_grab(
             )
         return True
 
-    # 未知回调兜底：回主菜单，绝不让界面卡死
-    logger.warning("未处理的回调: %s", data)
-    text, keyboard = page_root(uid)
+    # 未知 gb:/a:g* 前缀：交回入口的兜底分支处理，这里不渲染
+    logger.debug("cb_grab 未命中: %s", data)
     return False

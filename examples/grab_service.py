@@ -751,15 +751,26 @@ class GrabService:
                 logger.info("提现通知管理员 %s 失败：%s", admin.user_id, exc)
 
     def approve_withdrawal(self, wid: str, admin_id: int, txid: str = "") -> Withdrawal | None:
-        w = self.db.get_withdrawal(wid)
-        if not w or w.status != "pending":
-            return None
-        w.status = "paid"
-        w.txid = txid.strip()
-        w.processed_by = admin_id
-        w.processed_at = now_iso()
-        self.db.save_withdrawal(w)
-        return w
+        """审核通过（已人工打款）。必须在事务里读-改-写。
+
+        原实现是「读 → 判断 status == pending → 写」，三步不在事务内：
+        两个管理员同时点「通过」和「拒绝」时，拒绝方在事务里把状态改成 rejected
+        并退回余额，通过方随后无条件覆盖成 paid —— 用户既拿到打款又拿回积分。
+        这里用 atomic + CAS 把并发窗口关掉。
+        """
+        with self.db.atomic() as conn:
+            w = self.db.get_withdrawal(wid, conn=conn)
+            if not w or w.status != "pending":
+                return None
+            if not self.db.set_withdrawal_status(
+                wid, "paid", txid=txid.strip(), admin_id=admin_id, expect="pending", conn=conn
+            ):
+                return None
+            w.status = "paid"
+            w.txid = txid.strip()
+            w.processed_by = admin_id
+            w.processed_at = now_iso()
+            return w
 
     def reject_withdrawal(self, wid: str, admin_id: int, note: str = "") -> Withdrawal | None:
         """拒绝：退回可提现余额。"""

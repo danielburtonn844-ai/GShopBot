@@ -225,7 +225,10 @@ def page_admin_order(filter_status: str = "all") -> tuple[str, InlineKeyboardMar
             )
             buttons.append([(f"📄 {o.id}", f"a:od:{o.id}")])
         if len(orders) > 15:
-            lines.append(f"\n<i>仅显示最近 15 条，共 {len(orders)} 条</i>")
+            # 总数要从库里数，不能用 len(orders)：列表本身被 LIMIT 200 截断，
+            # 超过 200 条时会显示「共 200 条」，数字是错的
+            total = db.count_orders(None if filter_status == "all" else filter_status)
+            lines.append(f"\n<i>仅显示最近 15 条，共 {total} 条</i>")
 
     buttons.append([("⏳ 待处理", "a:of:pending"), ("🔄 处理中", "a:of:processing")])
     buttons.append([("✅ 已完成", "a:of:completed"), ("💰 已退款", "a:of:refunded")])

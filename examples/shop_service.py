@@ -62,6 +62,11 @@ BUY_FAIL_REASONS = {
 
 logger = logging.getLogger(__name__)
 
+# 强制关注检查缓存：(user_id, 频道ID元组) -> (monotonic 时间, 是否全部关注, 未关注列表)
+# TTL 60 秒：用户刚取关时最多 60 秒内仍可访问，换取主菜单不再每次都打 Telegram API。
+_FORCE_JOIN_CACHE: dict[tuple[int, tuple[str, ...]], tuple[float, bool, list]] = {}
+_FORCE_JOIN_TTL = 60.0
+
 
 class ShopService:
     def __init__(self, db: Database, okpay: Any = None) -> None:
@@ -147,6 +152,10 @@ class ShopService:
     async def check_user_channels(self, user_id: int) -> tuple[bool, list[Channel]]:
         """检查用户是否关注了所有强制频道。
         返回 (是否全部关注, 未关注的频道列表)。
+
+        带 60 秒短缓存：每点一次主菜单都要对所有强制频道调一次 get_chat_member
+        （一次网络往返），配 3 个频道就是 3 次 API 调用，高峰期明显拖慢界面。
+        频道集合变化时缓存自动失效（key 里带了 chat_id 列表）。
         """
         settings = self.db.get_settings()
         if not settings.get("force_channels", False):
@@ -159,6 +168,12 @@ class ShopService:
         if not self._bot:
             return True, []
 
+        key = (user_id, tuple(ch.chat_id for ch in channels))
+        now = time.monotonic()
+        cached = _FORCE_JOIN_CACHE.get(key)
+        if cached and now - cached[0] < _FORCE_JOIN_TTL:
+            return cached[1], cached[2]
+
         missing = []
         for channel in channels:
             try:
@@ -170,7 +185,12 @@ class ShopService:
                 # 如果机器人不是频道管理员，无法检查，暂时跳过
                 pass
 
-        return len(missing) == 0, missing
+        result = (len(missing) == 0, missing)
+        _FORCE_JOIN_CACHE[key] = (now, result[0], result[1])
+        # 简单容量控制：超过 5000 条就整体清掉，避免长期运行无限增长
+        if len(_FORCE_JOIN_CACHE) > 5000:
+            _FORCE_JOIN_CACHE.clear()
+        return result
 
     # ---------- 用户 ----------
 
@@ -387,16 +407,22 @@ class ShopService:
         return self.db.get_order(order_id)
 
     def complete_order(self, order_id: str, reply_content: str, admin_id: int) -> Order | None:
-        order = self.db.get_order(order_id)
-        if not order or order.status not in ("pending", "processing"):
-            return None  # 已终态的订单拒绝再次回单，防止覆盖
-        order.status = "completed"
-        order.reply_content = reply_content
-        order.reply_admin_id = admin_id
-        order.reply_at = now_iso()
-        order.completed_at = now_iso()
-        self.db.save_order(order)
-        return order
+        """管理员回单完成。读-改-写放同一事务，防止双击重复完成。
+
+        原实现三步不在事务内：两个管理员同时点「完成」都会通过状态检查，
+        各写一次，于是用户收到两条回单通知（若接了佣金结算还会重复记账）。
+        """
+        with self.db.atomic() as conn:
+            order = self.db.get_order(order_id, conn=conn)
+            if not order or order.status not in ("pending", "processing"):
+                return None  # 已终态的订单拒绝再次回单，防止覆盖
+            order.status = "completed"
+            order.reply_content = reply_content
+            order.reply_admin_id = admin_id
+            order.reply_at = now_iso()
+            order.completed_at = now_iso()
+            self.db.save_order(order, conn=conn)
+            return order
 
     def refund_order(self, order_id: str, admin_id: int) -> Order | None:
         """退款关闭。退积分、恢复库存、改状态、记流水在一个事务里原子提交。"""
@@ -409,7 +435,7 @@ class ShopService:
             user = self.db.get_user(order.user_id, conn=conn)
             if user:
                 user.points += order.points
-                user.total_spent -= order.points
+                user.total_spent = max(0, user.total_spent - order.points)
                 self.db.save_user(user, conn=conn)
                 self.db.add_point_record(
                     order.user_id, order.points, user.points,
@@ -448,7 +474,9 @@ class ShopService:
             return None
         settings = self.db.get_settings()
         rate = settings.get("points_rate", 10)
-        points = int(amount * rate)  # 规格：向下取整
+        # 全程 Decimal：float 下 0.29*100 == 28.999999999999996，int() 会少算 1 积分。
+        # v2.6.2 只修了冷钱包入口（create_chain_recharge），这个普通充值入口漏了。
+        points = int(Decimal(str(amount)) * Decimal(str(rate)))  # 规格：向下取整
 
         user = self.db.get_user(user_id)
         recharge = Recharge(
@@ -1043,22 +1071,23 @@ class ShopService:
         if not self._bot:
             return {"success": 0, "failed": 0}
 
-        users = self.db.list_users(limit=10000)
-        if target == "with_points":
-            users = [u for u in users if u.points > 0]
-        elif target == "no_points":
-            users = [u for u in users if u.points == 0]
-
         success = 0
         failed = 0
-        for user in users:
-            try:
-                await self._broadcast_one(user.user_id, text, photo, copy_from)
-                success += 1
-                await asyncio.sleep(0.05)  # 防止触发限流
-            except Exception as exc:
-                logger.warning("广播给用户 %s 失败：%s", user.user_id, exc)
-                failed += 1
+        # 按批遍历全部用户：原来 list_users(limit=10000) 在用户超过 1 万时
+        # 后面的人永远收不到广播，且没有任何报错。
+        for batch in self.db.iter_users(batch=500):
+            for user in batch:
+                if target == "with_points" and user.points <= 0:
+                    continue
+                if target == "no_points" and user.points != 0:
+                    continue
+                try:
+                    await self._broadcast_one(user.user_id, text, photo, copy_from)
+                    success += 1
+                    await asyncio.sleep(0.05)  # 防止触发限流
+                except Exception as exc:
+                    logger.warning("广播给用户 %s 失败：%s", user.user_id, exc)
+                    failed += 1
 
         return {"success": success, "failed": failed}
 

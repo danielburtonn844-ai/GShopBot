@@ -42,7 +42,6 @@ for _suffix in ("", "-wal", "-shm"):
         os.remove(_p)
 os.environ["SHOP_DB_PATH"] = TEST_DB  # 必须在导入 runtime 之前设置才生效
 
-from examples.runtime import db, grab, service, stock, supply  # noqa: E402
 from examples import (  # noqa: E402
     handlers_callback,
     handlers_command,
@@ -55,7 +54,8 @@ from examples import (  # noqa: E402
 )
 from examples.jobs import build_daily_report, do_backup  # noqa: E402
 from examples.models import LOCAL_TZ, TAGS, now_iso  # noqa: E402
-from examples.okpay import OkPay, flatten_params, build_base_string, sign_params  # noqa: E402
+from examples.okpay import OkPay, build_base_string, flatten_params, sign_params  # noqa: E402
+from examples.runtime import db, grab, service, stock  # noqa: E402
 from examples.shop_service import BUY_FAIL_REASONS  # noqa: E402
 from examples.ui import audit  # noqa: E402
 
@@ -128,6 +128,22 @@ class FakeMessage:
         self.replies.append((caption or "", reply_markup))
         RENDERED.append(("photo", caption or "", reply_markup))
         return self
+
+    async def edit_message_caption(self, caption=None, reply_markup=None, parse_mode=None, **kw):
+        """就地改图注（图片保留）——媒体感知 send_or_edit 的核心分支。"""
+        self.caption = caption
+        RENDERED.append(("caption", caption or "", reply_markup))
+        return self
+
+    async def edit_message_media(self, media=None, reply_markup=None, **kw):
+        """原地换图并改图注。"""
+        RENDERED.append(("media", getattr(media, "caption", "") or "", reply_markup))
+        return self
+
+    async def delete(self, **kw):
+        """删旧消息（图↔文互切时用）。不写 RENDERED，避免影响「是否有渲染」判定。"""
+        self.deleted = True
+        return True
 
     async def reply_document(self, document, filename=None, caption=None, **kw):
         self.replies.append((caption or "", None))
@@ -1049,7 +1065,7 @@ async def run():
     check("补货提醒送达两人", sent_n == 2, str(sent_n))
     check("提醒含商品名", any("池抢单Q" in t for _, t in fb3.sent))
     check("提醒后订阅清空", db.pop_restock_subscribers(p_race.id) == [])
-    res, _ = await fire_callback(USER1, "rsub:0:%s" % p_race.id)
+    res, _ = await fire_callback(USER1, f"rsub:0:{p_race.id}")
     check("取消订阅", res and "已取消" in res[1])
 
     # --- 内容重发：已购订单随时重发 ---
@@ -1117,7 +1133,7 @@ async def run():
     print("\n=== 22. 操作日志 ===")
     audit(ADMIN, "自检动作", "细节123")
     logs = db.list_audit_logs(limit=5)
-    check("日志写入", any(l.action == "自检动作" and "细节123" in l.detail for l in logs))
+    check("日志写入", any(row.action == "自检动作" and "细节123" in row.detail for row in logs))
     res, _ = await fire_callback(ADMIN, "a:logs")
     check("日志页渲染", res and "自检动作" in res[1])
 
@@ -1306,7 +1322,8 @@ async def run():
     # --- 冷钱包单不查支付平台 + 超时同样过期 ---
     rc_old = service.create_chain_recharge(USER1, 10, "trc20")
     check("重复下TRON单", rc_old is not None)
-    from datetime import datetime as _dtx, timedelta as _td
+    from datetime import datetime as _dtx
+    from datetime import timedelta as _td
     # save_recharge 的 upsert 刻意不覆盖 created_at，回填时间须走直接 SQL
     old_ts = (_dtx.now(LOCAL_TZ) - _td(hours=3)).isoformat()
     conn = db._get_conn()
@@ -1328,7 +1345,8 @@ async def run():
 
     # ========== 19. 抢单派单（v2.6.0） ==========
     print("\n=== 19. 抢单派单 ===")
-    from datetime import datetime as _dtg, timedelta as _tdg
+    from datetime import datetime as _dtg
+    from datetime import timedelta as _tdg
 
     GBUY = 333333  # 专用买家，避免与前面用例的余额互相干扰
     service.get_or_create_user(GBUY, username="gbuy")

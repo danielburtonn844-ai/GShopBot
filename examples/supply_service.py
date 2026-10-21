@@ -387,18 +387,20 @@ class SupplyService:
         keyboard = self.post_keyboard(in_channel=False)
         success = 0
         failed = 0
-        for u in self.db.list_users(limit=10000):
-            try:
-                # 安全发送：富文本（含高级会员表情）失败时自动降级纯文本重发
-                await send_html(
-                    bot, u.user_id, text,
-                    reply_markup=keyboard, photo=post.photo_file_id or "",
-                )
-                success += 1
-                await asyncio.sleep(0.05)
-            except Exception as exc:
-                logger.debug("供需广播给 %s 失败：%s", u.user_id, exc)
-                failed += 1
+        # 按批遍历全部用户（原 limit=10000 在用户超万时会静默漏人）
+        for batch in self.db.iter_users(batch=500):
+            for u in batch:
+                try:
+                    # 安全发送：富文本（含高级会员表情）失败时自动降级纯文本重发
+                    await send_html(
+                        bot, u.user_id, text,
+                        reply_markup=keyboard, photo=post.photo_file_id or "",
+                    )
+                    success += 1
+                    await asyncio.sleep(0.05)
+                except Exception as exc:
+                    logger.debug("供需广播给 %s 失败：%s", u.user_id, exc)
+                    failed += 1
         post.bot_ok = True
         self.db.save_supply_post(post)
         logger.info("供需 %s 广播完成：成功 %s 失败 %s", post.id, success, failed)

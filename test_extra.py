@@ -107,36 +107,57 @@ def test_ui() -> None:
     check("clear_state 清空 payload", "payload" not in c.user_data)
 
     # send_or_edit 的降级路径：HTML 解析失败 → 纯文本重发
-    class Q1:
-        class message:
-            @staticmethod
-            async def reply_photo(**kw):
-                raise AssertionError("不应走发图分支")
+    # 注意：v2.6.6 起 send_or_edit 是媒体感知的，编辑的是 query.message 而非 query 本身
+    class _Msg1:
+        def __init__(self):
+            self.photo = []
+            self.document = None
+            self.plain_called = False
 
-        @staticmethod
-        async def edit_message_text(**kw):
-            if kw.get("parse_mode") == "HTML":
+        async def edit_message_text(self, text=None, reply_markup=None, parse_mode=None, **kw):
+            if parse_mode == "HTML":
                 from telegram.error import BadRequest
 
                 raise BadRequest("Can't parse entities")
-            Q1.plain_called = True
+            self.plain_called = True
+            return self
 
-        plain_called = False
+        async def reply_text(self, text=None, reply_markup=None, **kw):
+            self.plain_called = True
+            return self
 
-    asyncio.new_event_loop().run_until_complete(send_or_edit(Q1(), "<b>坏标签", kb([[("x", "y")]])))
-    check("HTML 解析失败降级为纯文本", Q1.plain_called is True)
+    class Q1:
+        def __init__(self):
+            self.message = _Msg1()
 
-    # Message is not modified → 静默忽略
-    class Q2:
-        @staticmethod
-        async def edit_message_text(**kw):
+    q1 = Q1()
+    asyncio.new_event_loop().run_until_complete(send_or_edit(q1, "<b>坏标签", kb([[("x", "y")]])))
+    check("HTML 解析失败降级为纯文本", q1.message.plain_called is True)
+
+    # Message is not modified → 静默忽略（不重发、不报错）
+    class _Msg2:
+        def __init__(self):
+            self.photo = []
+            self.document = None
+            self.replied = False
+
+        async def edit_message_text(self, text=None, reply_markup=None, parse_mode=None, **kw):
             from telegram.error import BadRequest
 
             raise BadRequest("Message is not modified")
 
+        async def reply_text(self, text=None, reply_markup=None, **kw):
+            self.replied = True
+            return self
+
+    class Q2:
+        def __init__(self):
+            self.message = _Msg2()
+
+    q2 = Q2()
     try:
-        asyncio.new_event_loop().run_until_complete(send_or_edit(Q2(), "same", kb([[("x", "y")]])))
-        check("Message is not modified 被静默忽略", True)
+        asyncio.new_event_loop().run_until_complete(send_or_edit(q2, "same", kb([[("x", "y")]])))
+        check("Message is not modified 被静默忽略", q2.message.replied is False)
     except Exception as exc:
         check("Message is not modified 被静默忽略", False, repr(exc))
 
@@ -296,11 +317,126 @@ def test_db_facade() -> None:
     check("抢单表方法在 GrabMixin", hasattr(GrabMixin, "grab_order_atomic"))
 
 
+# ==================================================================
+# 欢迎图：主界面回退不丢图（媒体感知 send_or_edit）
+# ==================================================================
+def test_welcome_photo() -> None:
+    print("\n=== 欢迎图：回主界面不丢图 ===")
+    from telegram import InlineKeyboardMarkup
+
+    from examples.ui import send_or_edit
+
+    KBD = InlineKeyboardMarkup([[]])
+
+    class PhotoSize:
+        def __init__(self, fid):
+            self.file_id = fid
+
+    class Msg:
+        """模拟 Telegram 消息：记录走了哪条编辑路径。"""
+
+        def __init__(self, photo_fid=""):
+            self.photo = [PhotoSize(photo_fid)] if photo_fid else []
+            self.document = None
+            self.video = None
+            self.audio = None
+            self.voice = None
+            self.animation = None
+            self.deleted = False
+            self.calls: list[str] = []
+            self.caption = ""
+            self.text = ""
+
+        async def edit_message_text(self, text=None, reply_markup=None, parse_mode=None, **kw):
+            self.calls.append("edit_text")
+            self.text = text or ""
+            return self
+
+        async def edit_message_caption(self, caption=None, reply_markup=None, parse_mode=None, **kw):
+            self.calls.append("edit_caption")
+            self.caption = caption or ""
+            return self
+
+        async def edit_message_media(self, media=None, reply_markup=None, **kw):
+            self.calls.append("edit_media")
+            return self
+
+        async def reply_photo(self, photo=None, caption=None, reply_markup=None, **kw):
+            self.calls.append("reply_photo")
+            return self
+
+        async def reply_text(self, text=None, reply_markup=None, **kw):
+            self.calls.append("reply_text")
+            return self
+
+        async def delete(self, **kw):
+            self.calls.append("delete")
+            self.deleted = True
+            return True
+
+    class Q:
+        def __init__(self, msg):
+            self.message = msg
+
+    WELCOME = "AgACAgUAAxkBAAIWELCOME"
+
+    # 1) 当前已在带图主界面，再点主菜单 → 就地改图注，图保留，不删不发
+    m = Msg(WELCOME)
+    asyncio.new_event_loop().run_until_complete(send_or_edit(Q(m), "主菜单文字", KBD, photo=WELCOME))
+    check("带图消息回主菜单：走 edit_caption", m.calls == ["edit_caption"], str(m.calls))
+    check("带图消息回主菜单：图未丢（没删没重发）", not m.deleted and "reply_photo" not in m.calls)
+
+    # 2) 当前是纯文本子页面，返回主菜单 → 删旧发新（Telegram 不支持文→图就地转换）
+    m2 = Msg("")
+    asyncio.new_event_loop().run_until_complete(send_or_edit(Q(m2), "主菜单文字", KBD, photo=WELCOME))
+    check("纯文本消息回主菜单：先删旧消息", "delete" in m2.calls, str(m2.calls))
+    check("纯文本消息回主菜单：再发带图新消息", "reply_photo" in m2.calls, str(m2.calls))
+    check("纯文本消息回主菜单：不走 edit_text（否则图永远回不来）",
+          "edit_text" not in m2.calls, str(m2.calls))
+
+    # 3) 当前是另一张图，目标换图 → edit_media 原地换，不删消息
+    m3 = Msg("OTHER_IMAGE")
+    asyncio.new_event_loop().run_until_complete(send_or_edit(Q(m3), "主菜单文字", KBD, photo=WELCOME))
+    check("异图切换：走 edit_media", m3.calls == ["edit_media"], str(m3.calls))
+    check("异图切换：不删消息", not m3.deleted)
+
+    # 4) 目标无图（子页面），当前是图 → 删旧发新
+    m4 = Msg(WELCOME)
+    asyncio.new_event_loop().run_until_complete(send_or_edit(Q(m4), "商品列表", KBD, photo=None))
+    check("从主菜单进子页：删旧消息", "delete" in m4.calls, str(m4.calls))
+    check("从主菜单进子页：发纯文字", "reply_text" in m4.calls, str(m4.calls))
+
+    # 5) 目标无图，当前也无图 → 就地改文字，不删不重发
+    m5 = Msg("")
+    asyncio.new_event_loop().run_until_complete(send_or_edit(Q(m5), "商品列表", KBD, photo=None))
+    check("纯文本页间切换：就地 edit_text", m5.calls == ["edit_text"], str(m5.calls))
+
+    # 6) 文案超过 caption 上限 → 主动放弃带图，退回纯文字（避免编辑失败丢整页）
+    m6 = Msg("")
+    long_text = "字" * 1100
+    asyncio.new_event_loop().run_until_complete(send_or_edit(Q(m6), long_text, KBD, photo=WELCOME))
+    check("超长文案自动放弃带图", "reply_photo" not in m6.calls, str(m6.calls))
+    check("超长文案仍能渲染文字", "reply_text" in m6.calls or "edit_text" in m6.calls, str(m6.calls))
+
+    # 7) home_photo() 读的是 settings 里的 welcome_image
+    tmp = tempfile.mkdtemp()
+    os.environ["SHOP_DB_PATH"] = os.path.join(tmp, "wp.db")
+    import examples.runtime as rt
+
+    rt.db.__init__(os.environ["SHOP_DB_PATH"])
+    from examples.pages_user import home_photo
+
+    check("未设置欢迎图时返回空串", home_photo() == "")
+    rt.db.update_settings(welcome_image=WELCOME)
+    check("设置后 home_photo 返回 file_id", home_photo() == WELCOME, home_photo())
+
+
 if __name__ == "__main__":
     test_ui()
     test_supply_pricing()
     test_chain_utils()
     test_db_facade()
+    test_welcome_photo()
     print(f"\n{'=' * 50}")
     print(f"✅ 通过 {PASS} 项   ❌ 失败 {FAIL} 项")
     print("=" * 50)

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+from collections.abc import Iterator
 
 from ..schema import (
     User,
@@ -55,6 +56,23 @@ class UserMixin:
         finally:
             conn.close()
 
+    def iter_users(self, batch: int = 500) -> Iterator[list[User]]:
+        """按批遍历全部用户（广播 / 全量提醒用）。
+
+        原实现直接 `list_users(limit=10000)`：用户超过 1 万后，第 10001 个之后的
+        用户永远收不到广播，且没有任何报错。改成按 created_at + user_id 稳定
+        分页，保证不漏人，同时每批只占 batch 条内存。
+        """
+        offset = 0
+        while True:
+            rows = self.list_users(limit=batch, offset=offset)
+            if not rows:
+                return
+            yield rows
+            if len(rows) < batch:
+                return
+            offset += batch
+
     # ---------- 商品 ----------
 
     def search_users(self, query: str, limit: int = 20) -> list[User]:
@@ -67,6 +85,22 @@ class UserMixin:
             return [User.from_dict(dict(r)) for r in rows]
         finally:
             conn.close()
+
+    def get_user_by_username(self, username: str, conn: sqlite3.Connection | None = None) -> User | None:
+        """按 username 精确反查（忽略大小写，去掉前导 @）。
+
+        原实现是「取前 500 个用户再线性比对」，用户超过 500 后新用户永远找不到。
+        这里走 SQL 索引查询，与用户总量无关。
+        """
+        name = (username or "").strip().lstrip("@")
+        if not name:
+            return None
+        with self._maybe_conn(conn) as c:
+            row = c.execute(
+                "SELECT * FROM users WHERE LOWER(username) = LOWER(?) ORDER BY created_at DESC LIMIT 1",
+                (name,),
+            ).fetchone()
+            return User.from_dict(dict(row)) if row else None
 
     def count_users(self) -> int:
         conn = self._get_conn()

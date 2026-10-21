@@ -4,7 +4,7 @@
 
 **Telegram 自助报单 + 积分商城 + 抢单派单机器人**
 
-版本 `v2.6.5` · Python 3.10+ · SQLite · python-telegram-bot 22.8
+版本 `v2.6.6` · Python 3.10+ · SQLite · python-telegram-bot 22.8
 
 [![CI](https://github.com/danielburtonn844-ai/GShopBot/actions/workflows/ci.yml/badge.svg)](https://github.com/danielburtonn844-ai/GShopBot/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
@@ -114,8 +114,8 @@ vim .env
 
 ```bash
 python3 test_bot_full.py           # 业务全链路自检，7207 项
-python3 verify_issues.py           # 缺陷回归，43 项
-python3 test_extra.py              # 分支补强，71 项
+python3 verify_issues.py           # 缺陷回归，47 项
+python3 test_extra.py              # 分支补强，85 项
 python3 test_coverage_boost.py     # 深度覆盖，75 项
 ```
 
@@ -237,8 +237,8 @@ data/
 └── shop.db                 数据库（自动生成，已 gitignore）
 
 test_bot_full.py            自检脚本（7207 断言，全离线）
-verify_issues.py            缺陷回归（43 断言：佣金竞态 / 链上分页 / 更新订阅 / 金额精度 / 尾数唯一性 / TON 协议 / 补账 / 退款快照）
-test_extra.py               分支补强（71 断言：UI 降级 / 供需定价 / 地址校验 / 门面完整性）
+verify_issues.py            缺陷回归（47 断言：佣金竞态 / 链上分页 / 更新订阅 / 金额精度 / 尾数唯一性 / TON 协议 / 补账 / 退款快照 / 普通充值精度）
+test_extra.py               分支补强（85 断言：UI 降级 / 欢迎图媒体切换 / 供需定价 / 地址校验 / 门面完整性）
 test_coverage_boost.py      深度覆盖（75 断言：供需全流程 / 抢单回调 / 后台任务 / 链上异常 / 状态机）
 .github/workflows/ci.yml    CI：ruff + 语法 + 四套测试 + 覆盖率门槛 75%（Python 3.10/3.11/3.12）
 pyproject.toml              项目元数据 + ruff 规则
@@ -260,6 +260,8 @@ pyproject.toml              项目元数据 + ruff 规则
 | **限额下沉** | 限额校验在 service 层 `validate_recharge_amount`，所有渠道必经，改包绕不过 |
 | **尾数识别** | TRON 无 memo，用 `0.001~0.999` 唯一金额尾数匹配，尾数池 999 个，占满拒单不复用 |
 | **防偷老板** | 匿名派单卡片不含买家任何信息；群内公示只显示接单员编号 |
+| **媒体感知更新** | `send_or_edit` 按「当前消息承载什么媒体」决定走 `edit_caption` / `edit_media` / `edit_text` / 删旧发新，主界面欢迎图在来回切换中不会丢 |
+| **强制关注缓存** | 频道检查结果按 `(user_id, 频道集合)` 缓存 60 秒，避免每点一次按钮就打 N 次 Telegram API |
 
 ### 已修复的历史缺陷
 
@@ -275,8 +277,16 @@ pyproject.toml              项目元数据 + ruff 规则
 | TON 解析与 TonCenter v3 不兼容 | `destination_wallet` 参数无效、friendly/raw 地址比不相等、备注读错字段 → TON 充值从不入账 | 改 `owner_address`；`ton_normalize_address()` 统一格式；读 `decoded_forward_payload.comment`；检查 `transaction_aborted` |
 | 超时单直接标 failed | 停机/接口故障期间已付款订单永久丢失 | 标 failed 前先查账；`allow_failed=True` 保留补记通道 |
 | 供需退款按当前价格 | 调价后分发失败超额退款（扣 1 退 100） | 发帖时快照 `channel_leg`，退款按快照且封顶实付总额 |
+| 普通充值入口 `int(amount * rate)` | 0.29 / 0.57 / 0.58 少算 1 积分（v2.6.2 只修了冷钱包入口） | 改 `Decimal` 计算 |
+| 充值确认页同算法 | 页面写「获得 100」实际入账 99 | 与写入侧共用 Decimal |
+| 提现审核「通过」无事务 | 与「拒绝」并发时用户既拿到打款又拿回积分 | `atomic()` + `set_withdrawal_status(expect="pending")` CAS |
+| 管理员回单无事务 | 双击产生两条回单通知 | 放入 `atomic()` |
+| 自动备份开关无效 | 关掉后仍每天 04:30 备份 | 循环内读 `daily_backup_enabled` |
+| 广播 `limit=10000` | 超万用户静默漏人 | `iter_users(batch=500)` 分批遍历 |
+| 按 username 找人查前 500 | 新用户永远找不到 | 走 SQL `get_user_by_username` |
+| 订单页总数用 `len(orders)` | 超 200 单显示「共 200 条」 | 改 `count_orders()` |
 
-以上全部有回归用例，`python3 verify_issues.py` 可复现验证（43 项断言）。
+以上全部有回归用例，`python3 verify_issues.py` 可复现验证（47 项断言）。
 
 ---
 
