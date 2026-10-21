@@ -29,7 +29,7 @@ jobs:
       - name: Lint (ruff)
         run: |
           pip install ruff
-          ruff check main.py examples verify_issues.py test_extra.py
+          ruff check main.py examples verify_issues.py test_extra.py test_coverage_boost.py
 
       - name: Syntax check
         run: python -m compileall -q main.py examples verify_issues.py
@@ -43,12 +43,16 @@ jobs:
       - name: Extra branch coverage tests
         run: python test_extra.py
 
-      - name: Coverage (fail under 70%)
+      - name: Deep coverage tests
+        run: python test_coverage_boost.py
+
+      - name: Coverage (fail under 75%)
         run: |
           pip install coverage
           coverage run --source=examples,main test_bot_full.py
           coverage run -a --source=examples,main test_extra.py
-          coverage report --fail-under=70 --skip-covered
+          coverage run -a --source=examples,main test_coverage_boost.py
+          coverage report --fail-under=75 --skip-covered
 
       - name: Import smoke test
         run: |

@@ -1,5 +1,75 @@
 # CHANGELOG — G Shop Bot
 
+## v2.6.5 · 2026-10-21 · 覆盖率补强 + 一个真实缺陷
+
+### 修复
+
+- **[抢单] `_toast()` 参数名不匹配，三处错误提示直接抛 TypeError**
+
+```python
+# 定义
+async def _toast(text: str, alert: bool = True) -> None: ...
+# 调用（3 处）
+await _toast(err or "生成失败", show_alert=True)
+```
+
+`alert` 与 `show_alert` 不匹配 → `TypeError: _toast() got an unexpected keyword argument 'show_alert'`。
+
+受影响的三条路径都是**错误提示**，也就是说「出了错要告诉用户」的那条路本身会炸：
+
+| 位置 | 场景 |
+|---|---|
+| `gb:inv` | 专属入群链接生成失败 |
+| `a:gblink` | 管理员重发接单员链接失败 |
+| `a:gblink` | 链接生成成功但私聊发送失败 |
+
+用户看到的是「点了没反应」，而不是真实原因。修法：参数名对齐 Bot API 的 `answerCallbackQuery(show_alert=...)`，并加 `**_ignored` 兜住历史别名。
+
+这个 bug 是写 `test_coverage_boost.py` 时被测出来的——原来的 7207 项自检没覆盖到这三条失败分支。
+
+### 新增 test_coverage_boost.py（75 项）
+
+补之前完全没走到的模块：
+
+| 组 | 覆盖内容 |
+|---|---|
+| **供需全流程** | 发布扣费 / 空内容 / 超长 / 暂停 / 积分不足 / 封禁 / 日限 / 频道未配置 / 审核通过 / 审核拒绝退款 / 重复审核幂等 / bot 广播 / 频道发送失败退腿 / 删帖退款 / 统计 |
+| **抢单回调** | `gb:m` `gb:doing` `gb:done` `gb:money` `gb:wd` `gb:wdnew` `gb:inv` `gb:rank` `gb:aps` + 管理端 `a:grab` `a:gbers` `a:gbadd` `a:gords` `a:gwds` `a:gaps` `a:gset` |
+| **后台任务** | 5 个常驻协程各跑完一轮（把 `asyncio.sleep` 换成立即返回，第二轮抛 `CancelledError` 退出） |
+| **链上异常** | 网络异常 / 坏 JSON / 单条脏数据不影响整批 |
+| **输入状态机** | 无状态消息 / 群聊消息被忽略 / 搜索状态 / 未知状态清理 |
+
+### 覆盖率
+
+| 模块 | 之前 | 现在 |
+|---|---|---|
+| `supply_service.py` | 26% | **90%** |
+| `chain_watch.py` | 37% | **74%** |
+| `cb_grab.py` | 34% | 48% |
+| `jobs.py` | 37% | 通过 |
+| **总计** | 71% | **76%** |
+
+CI 门槛从 70% 提到 **75%**。
+
+### 测试策略上的两个坑（记录备查）
+
+1. **常驻协程不能直接 await**
+   `jobs.py` 里都是 `while True: await asyncio.sleep(N)`，直接 `await` 会永久挂住测试进程（实测卡到超时）。做法是 patch `asyncio.sleep` 成「第一次立即返回、第二次抛 `CancelledError`」，跑完一轮循环体后正常退出。
+
+2. **后台任务的完成时间要按数据量算**
+   `_broadcast_bot` 是 `create_task`，每发一个用户 `sleep(0.05)`。测试库里 8 个用户 → 至少 0.4 秒，原来只等 0.3 秒，`bot_ok` 还没置位就断言了。改成按用户数估时。
+
+```
+test_bot_full.py          → ✅ 7207 项
+verify_issues.py          → ✅ 43 项
+test_extra.py             → ✅ 71 项
+test_coverage_boost.py    → ✅ 75 项
+ruff check                → All checks passed
+coverage                  → 76%
+```
+
+---
+
 ## v2.6.4 · 2026-10-20 · 结构重构（数据层与回调分发拆分）
 
 纯重构，零行为变更。三个测试套件全绿，其中 7207 项业务断言一项未改即通过——这是「重构没改行为」的证明。

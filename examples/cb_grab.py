@@ -48,10 +48,17 @@ async def _dispatch_grab(
     # 抢单模块（v2.6.0）：gb:* 接单员端 / a:g* 管理端接单管理
     # ==================================================================
 
-    async def _toast(text: str, alert: bool = True) -> None:
-        """二次弹 toast（入口处已 answer 过一次，这里容错）。"""
+    async def _toast(text: str, show_alert: bool = True, **_ignored) -> None:
+        """二次弹 toast（入口处已 answer 过一次，这里容错）。
+
+        参数名与 Telegram Bot API 的 `answerCallbackQuery` 保持一致（show_alert），
+        早期实现写成 `alert`，而 3 处调用点传的是 `show_alert=True`，导致这些
+        错误提示路径（邀请链接生成失败 / 重发失败 / 私聊发送失败）直接抛
+        TypeError，用户看到的是「点了没反应」而不是错误原因。
+        `**_ignored` 兜住历史调用里的其它别名，避免同类问题再炸。
+        """
         try:
-            await query.answer(text=text[:190], show_alert=alert)
+            await query.answer(text=text[:190], show_alert=show_alert)
         except Exception:
             pass
 

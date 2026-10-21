@@ -4,7 +4,7 @@
 
 **Telegram 自助报单 + 积分商城 + 抢单派单机器人**
 
-版本 `v2.6.4` · Python 3.10+ · SQLite · python-telegram-bot 22.8
+版本 `v2.6.5` · Python 3.10+ · SQLite · python-telegram-bot 22.8
 
 [![CI](https://github.com/danielburtonn844-ai/GShopBot/actions/workflows/ci.yml/badge.svg)](https://github.com/danielburtonn844-ai/GShopBot/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
@@ -113,19 +113,21 @@ vim .env
 ### 4. 跑测试
 
 ```bash
-python3 test_bot_full.py    # 业务全链路自检，7207 项
-python3 verify_issues.py    # 缺陷回归，43 项
-python3 test_extra.py       # 分支补强，71 项
+python3 test_bot_full.py           # 业务全链路自检，7207 项
+python3 verify_issues.py           # 缺陷回归，43 项
+python3 test_extra.py              # 分支补强，71 项
+python3 test_coverage_boost.py     # 深度覆盖，75 项
 ```
 
 全部离线运行（链上 API 走 mock，支付接口走 stub），强制走 `SHOP_DB_PATH` 隔离，不会碰正式库，也不需要联网。
 
-覆盖率：
+覆盖率（当前 76%）：
 
 ```bash
 pip install coverage
 coverage run --source=examples,main test_bot_full.py
 coverage run -a --source=examples,main test_extra.py
+coverage run -a --source=examples,main test_coverage_boost.py
 coverage report --skip-covered
 ```
 
@@ -133,7 +135,7 @@ coverage report --skip-covered
 
 ```bash
 pip install ruff
-ruff check main.py examples verify_issues.py test_extra.py
+ruff check main.py examples verify_issues.py test_extra.py test_coverage_boost.py
 ```
 
 ### 5. 启动
@@ -237,7 +239,8 @@ data/
 test_bot_full.py            自检脚本（7207 断言，全离线）
 verify_issues.py            缺陷回归（43 断言：佣金竞态 / 链上分页 / 更新订阅 / 金额精度 / 尾数唯一性 / TON 协议 / 补账 / 退款快照）
 test_extra.py               分支补强（71 断言：UI 降级 / 供需定价 / 地址校验 / 门面完整性）
-.github/workflows/ci.yml    CI：ruff + 语法 + 三套测试 + 覆盖率门槛（Python 3.10/3.11/3.12）
+test_coverage_boost.py      深度覆盖（75 断言：供需全流程 / 抢单回调 / 后台任务 / 链上异常 / 状态机）
+.github/workflows/ci.yml    CI：ruff + 语法 + 四套测试 + 覆盖率门槛 75%（Python 3.10/3.11/3.12）
 pyproject.toml              项目元数据 + ruff 规则
 ```
 
