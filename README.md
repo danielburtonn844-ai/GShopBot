@@ -136,7 +136,7 @@ coverage report --skip-covered
 
 ```bash
 pip install ruff
-ruff check main.py examples verify_issues.py test_extra.py test_coverage_boost.py
+ruff check main.py examples verify_issues.py test_extra.py test_coverage_boost.py bench_concurrency.py
 ```
 
 ### 5. 启动
@@ -252,46 +252,18 @@ pyproject.toml              项目元数据 + ruff 规则
 
 | 项 | 说明 |
 |---|---|
-| **金额精度** | 充值积分换算、提现汇率、限额校验全程 `Decimal`；提现用 `ROUND_HALF_UP` 而非 Python 默认的银行家舍入 |
-| **资金安全** | 所有余额变动在事务内；佣金解冻走 CAS（`WHERE status='frozen'`），自动与手动解冻交错时不会重复入账 |
-| **并发抢单** | `UPDATE ... WHERE grab_status='waiting'` 条件更新，天然原子，无锁 |
-| **链上幂等** | `chain_txids` 表以 txid 为主键，入账 `INSERT OR IGNORE`，重启或重复轮询不重复加分 |
-| **链上增量扫描** | 游标持久化在 settings（`tron_scan_cursor_ms` / `ton_scan_cursor_ms`），每轮只扫游标之后；TronGrid 按 `meta.fingerprint` 翻页，历史超过单页容量也不会漏新单 |
-| **更新订阅** | `run_polling(allowed_updates=...)` 显式订阅 `chat_member`——Bot API 默认集合不含它，不显式声明则退群停权/邀请链接校验全部静默失效 |
-| **地址校验** | TRON Base58Check（T 开头 34 位）、TON friendly CRC16（EQ/UQ 48 位），不合法拒存 |
-| **限额下沉** | 限额校验在 service 层 `validate_recharge_amount`，所有渠道必经，改包绕不过 |
-| **尾数识别** | TRON 无 memo，用 `0.001~0.999` 唯一金额尾数匹配，尾数池 999 个，占满拒单不复用 |
-| **防偷老板** | 匿名派单卡片不含买家任何信息；群内公示只显示接单员编号 |
-| **媒体感知更新** | `send_or_edit` 按「当前消息承载什么媒体」决定走 `edit_caption` / `edit_media` / `edit_text` / 删旧发新，主界面欢迎图在来回切换中不会丢 |
-| **强制关注缓存** | 频道检查结果按 `(user_id, 频道集合)` 缓存 60 秒，避免每点一次按钮就打 N 次 Telegram API |
-| **连接复用** | 每线程复用一条持久 SQLite 连接（`threading.local`），WAL 只设一次。压测：1000 次读写从 14 次/秒 → 249 次/秒 |
-| **锁重试** | WAL 下「读升级写」会立刻报 `database is locked`（busy_timeout 不生效），`execute()` 退避重试 3 次兜住 |
-| **并发实测** | 100 线程抢同一单只有 1 人成功；50 笔并发解冻不重复入账；200 并发下单尾数全唯一；提现通过/拒绝并发无双生效（见 `bench_concurrency.py`） |
+| 金额精度 | 积分换算、提现汇率、限额校验全程 `Decimal`；提现用 `ROUND_HALF_UP` |
+| 资金安全 | 余额变动在事务内；佣金解冻、提现审核、回单均走 CAS，并发不会重复入账 |
+| 并发抢单 | `UPDATE ... WHERE grab_status='waiting'` 条件更新，无锁原子 |
+| 链上幂等 | `chain_txids` 以 txid 为主键，重复轮询不重复加分 |
+| 增量扫描 | 游标持久化，TronGrid 按 `meta.fingerprint` 翻页，历史超单页也不漏单 |
+| 尾数识别 | TRON 无 memo，用 `0.001~0.999` 唯一尾数匹配，池 999 个，占满拒单 |
+| 地址校验 | TRON Base58Check、TON friendly CRC16，不合法拒存 |
+| 连接复用 | 每线程一条持久 SQLite 连接，WAL 只设一次；1000 次读写 14 → 249 次/秒 |
+| 媒体感知更新 | `send_or_edit` 按消息当前媒体选择编辑方式，主界面欢迎图切换不丢 |
+| 防偷老板 | 匿名派单卡片不含买家信息，群内只显示接单员编号 |
 
-### 已修复的历史缺陷
-
-| 缺陷 | 影响 | 修法 |
-|---|---|---|
-| 自动解冻与手动解冻交错执行 | 同一笔佣金被两次计入可提现余额（100 → 300） | `set_commission_status(..., expect="frozen")` 做 CAS，未命中则跳过记账 |
-| 手动解冻只查前 500 条冻结记录 | 超过 500 笔后更早的佣金无法解冻 | 新增 `get_grab_commission(cid)` 按主键取单 |
-| TRON 监听无分页、无时间游标 | 历史转账超过 50 笔后，新充值永远进不来 | `meta.fingerprint` 翻页 + 持久化扫描游标 + 60 秒重叠窗口 |
-| `run_polling()` 未指定 `allowed_updates` | `chat_member` 默认不投递，退群停权/专属链接风控静默失效 | 显式订阅 MESSAGE / CALLBACK_QUERY / CHAT_MEMBER / MY_CHAT_MEMBER |
-| 充值积分 `int(float(x) * rate)` | 尾数 0.29 / 0.57 / 0.58 时少算 1 积分 | 改 `int(Decimal(x) * Decimal(rate))` |
-| 提现 `round()` 银行家舍入 | 2.5 → 2，少付 0.5U | `Decimal.quantize(..., ROUND_HALF_UP)` |
-| 尾数分配依赖 `LIMIT 200` 列表 | 待支付单超 200 笔后尾数重复，付款记到别人账上 | 按整数金额全表扫描 + 分配与落库同事务 |
-| TON 解析与 TonCenter v3 不兼容 | `destination_wallet` 参数无效、friendly/raw 地址比不相等、备注读错字段 → TON 充值从不入账 | 改 `owner_address`；`ton_normalize_address()` 统一格式；读 `decoded_forward_payload.comment`；检查 `transaction_aborted` |
-| 超时单直接标 failed | 停机/接口故障期间已付款订单永久丢失 | 标 failed 前先查账；`allow_failed=True` 保留补记通道 |
-| 供需退款按当前价格 | 调价后分发失败超额退款（扣 1 退 100） | 发帖时快照 `channel_leg`，退款按快照且封顶实付总额 |
-| 普通充值入口 `int(amount * rate)` | 0.29 / 0.57 / 0.58 少算 1 积分（v2.6.2 只修了冷钱包入口） | 改 `Decimal` 计算 |
-| 充值确认页同算法 | 页面写「获得 100」实际入账 99 | 与写入侧共用 Decimal |
-| 提现审核「通过」无事务 | 与「拒绝」并发时用户既拿到打款又拿回积分 | `atomic()` + `set_withdrawal_status(expect="pending")` CAS |
-| 管理员回单无事务 | 双击产生两条回单通知 | 放入 `atomic()` |
-| 自动备份开关无效 | 关掉后仍每天 04:30 备份 | 循环内读 `daily_backup_enabled` |
-| 广播 `limit=10000` | 超万用户静默漏人 | `iter_users(batch=500)` 分批遍历 |
-| 按 username 找人查前 500 | 新用户永远找不到 | 走 SQL `get_user_by_username` |
-| 订单页总数用 `len(orders)` | 超 200 单显示「共 200 条」 | 改 `count_orders()` |
-
-以上全部有回归用例，`python3 verify_issues.py` 可复现验证（47 项断言）。
+历史缺陷与对应的修复方式见 [CHANGELOG](CHANGELOG.md)。
 
 ---
 

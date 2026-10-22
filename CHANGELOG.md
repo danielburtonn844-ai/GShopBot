@@ -1,282 +1,194 @@
 # CHANGELOG — G Shop Bot
 
-## v2.6.7 · 2026-10-22 · 并发压测 + 数据库连接复用
+## v2.6.7 · 2026-10-22
 
-### 先说结论：并发「安全」早就有，「性能」这次才补上
+### 新增
 
-原来的代码在**正确性**上一直是并发安全的（CAS、事务、原子 UPDATE），但从来没人用真实竞争验证过，而且**连接管理方式让并发吞吐低得离谱**。
+- `bench_concurrency.py`：多线程并发压测，覆盖抢单原子性、佣金解冻、尾数分配、提现审核、读写吞吐五项。与单元测试的区别在于使用多线程加独立连接访问同一个库，形成真实写锁竞争。
 
-这次做了两件事：写出压测把这些行为钉死，再把连接层重做。
+### 性能
 
-### 压测（新增 `bench_concurrency.py`）
+- **数据库连接复用**。原 `_get_conn()` 每次调用执行 `sqlite3.connect()` + 2 条 PRAGMA + `close()`，实测单次 3.63 ms，其中 PRAGMA 占 76%。`journal_mode=WAL` 属于数据库级持久设置，写入文件头后对所有连接生效，逐次重设无实际作用。现改为每线程复用一条持久连接（`threading.local`），初始化只在首次连接时执行；`close()` 由 `_PooledConn` 代理改为归还语义，60 余处调用点无需修改。
 
-用**多线程 + 独立连接**打同一个库，制造真实写锁竞争（单元测试是单协程顺序执行，验证不了竞争）。
+  | 指标 | 调整前 | 调整后 |
+  |---|---|---|
+  | 1000 次读写（20 线程） | 14 次/秒 | 249 次/秒 |
+  | 100 线程抢同一单 | 6820 ms | 208 ms |
 
-| 场景 | 断言 | 结果 |
-|---|---|---|
-| 100 线程抢同一单 | 只能 1 人成功 | ✅ 唯一成功者，库中 grabber_id 就是赢家 |
-| 自动解冻 × 4 + 手动解冻 × 50 并发 | 余额 = 已解冻总额 | ✅ 1000 = 1000，不重复入账 |
-| 200 线程并发建 TRON 充值单（同金额） | 尾数全唯一 | ✅ 200 笔 200 个不同尾数 |
-| 提现「通过」vs「拒绝」20 轮并发 | 无双生效 | ✅ 0 轮双生效 |
-| 1000 次读写在 20 线程下 | 吞吐达标、无锁错误 | ✅ 249 次/秒，0 次 locked |
+### 修复
 
-### 性能修复：每次操作都新建连接
-
-**问题**：`_get_conn()` 每次调用都是 `sqlite3.connect()` + 2 条 PRAGMA + `close()`。实测单次 **3.63ms**，其中 PRAGMA 占 **76%**。而 `journal_mode=WAL` 是**数据库级持久设置**（写进文件头），后续任何连接自动生效，每次重设纯属浪费。
-
-**压测证据**（1000 次读写在 20 线程下）：
-
-| 版本 | 吞吐 |
-|---|---|
-| 改造前 | **14 次/秒** |
-| 改造后 | **249 次/秒** |
-
-100 线程抢同一单：**6820ms → 208ms**（33 倍）。
-
-**修法**：每条线程复用一条持久连接（`threading.local`），`sqlite3.connect(...)` 只在首次执行。为了让 60+ 处 `conn.close()` 零改动，用一个 `_PooledConn` 代理把 `close()` 变成「归还」。
-
-### 踩到的坑：close() 里回滚会毁掉外层事务
-
-第一版 `_PooledConn.close()` 写得「很谨慎」——发现连接上有未提交事务就 rollback。结果：
-
-```
-回单返回「成功」，但库里订单状态还是 pending
-```
-
-原因：`atomic()` 事务块内部任何一次读操作（比如 `db.get_setting()`，它自己 `_get_conn()` 再 `close()`）都会命中同一条池化连接，于是把**外层尚未提交的事务整个回滚掉**。
-
-修法：`close()` 只标记归还、不碰事务；事务由 `atomic()` 和 `_maybe_conn()` 显式 commit / rollback。
-
-### 锁冲突重试
-
-WAL 下「读事务升级写事务」会返回 `SQLITE_BUSY_SNAPSHOT`，这种冲突 `busy_timeout` 不生效、立刻报 locked。压测里 1000 次读写有 5 次踩到。
-
-修法：`execute()` 捕获 `database is locked` 退避重试 3 次；`busy_timeout` 从 5 秒提到 10 秒。
+- **`close()` 回滚未提交事务导致外层事务失效**。`atomic()` 事务块内的读操作（如 `get_setting()` 自行取连接后 `close()`）会命中同一条池化连接，将外层尚未提交的事务一并回滚，现象为回单返回成功但订单状态未落库。`close()` 现仅标记归还，事务由 `atomic()` 与 `_maybe_conn()` 显式 commit / rollback。
+- **WAL 下读事务升级写事务立即返回 `database is locked`**。该错误绕过 `busy_timeout` 等待，压测中 1000 次读写出现 5 次。`execute()` 增加 3 次退避重试（20 / 40 ms），`busy_timeout` 由 5 秒调整为 10 秒。
 
 ### 索引
 
-充值表原来没有任何索引，链上轮询和尾数分配都是全表扫。新增：
+充值表原先无索引，链上轮询与尾数分配均走全表扫描。新增：
 
 ```sql
 CREATE INDEX idx_recharge_status_chain ON recharges(status, chain);
 CREATE INDEX idx_recharge_user ON recharges(user_id, created_at);
 ```
 
+### 压测结果
+
+| 场景 | 断言 | 结果 |
+|---|---|---|
+| 100 线程抢同一单 | 仅 1 人成功 | 通过，库中 `grabber_id` 与胜者一致 |
+| 自动解冻 × 4 + 手动解冻 × 50 并发 | 余额等于已解冻总额 | 通过，1000 = 1000 |
+| 200 线程并发建 TRON 充值单（同金额） | 尾数互不重复 | 通过，200 笔 200 个尾数 |
+| 提现「通过」与「拒绝」20 轮并发 | 无双生效 | 通过，0 轮双生效 |
+| 1000 次读写（20 线程） | 吞吐达标、无锁错误 | 通过，249 次/秒，0 次 locked |
+
 ### 验证
 
 ```
-test_bot_full.py        → ✅ 7207 项
-verify_issues.py        → ✅   47 项
-test_extra.py           → ✅   85 项
-test_coverage_boost.py  → ✅   75 项
-bench_concurrency.py    → ✅   10 项（含真实写锁竞争）
-ruff check              → All checks passed
+test_bot_full.py        7207 项
+verify_issues.py          47 项
+test_extra.py             85 项
+test_coverage_boost.py    75 项
+bench_concurrency.py      10 项
+ruff check              All checks passed
 ```
 
 ---
 
-## v2.6.6 · 2026-10-21 · 欢迎图常驻 + 五个静默缺陷
+## v2.6.6 · 2026-10-21
 
-### 功能：主界面欢迎图不再消失（参照扎堆号铺的媒体感知更新）
+### 新增
 
-**问题复现**：`/start` 发的是带欢迎图的图文消息 → 点任意按钮进子页 → 图被 `edit_message_text` 抹成纯文字 → 再点「主菜单」返回，走的仍是无图分支，**图彻底回不来**。
+- **主界面欢迎图常驻**。`send_or_edit` 改为媒体感知更新，按当前消息承载的媒体决定处理方式：
 
-**根因**：`send_or_edit(query, text, kb)` 只有「有图 → 发新消息」和「无图 → 改文字」两条路，而 Tele­gram 的 `editMessageText` 不能保留图片，`editMessageCaption` 不会在纯文字消息上创建图片。
+  | 当前消息 | 目标 | 处理 |
+  |---|---|---|
+  | 图文 | 同一张图 | `edit_message_caption` 就地改图注 |
+  | 图文 | 另一张图 | `edit_message_media` 原地换图 |
+  | 图文 | 无图 | 删除旧消息后重发 |
+  | 文字 | 有图 | 删除旧消息后重发 |
+  | 文字 | 无图 | `edit_message_text` |
 
-**修法**（对齐扎堆号铺的 `send_or_edit` 设计）：把「当前消息承载什么媒体」纳入决策。
+  原实现仅有「有图发新消息 / 无图改文字」两条路径，而 Telegram 的 `editMessageText` 不保留图片，`editMessageCaption` 无法在纯文字消息上创建图片，因此从子页面返回主界面后图片无法恢复。
 
-| 当前消息 | 目标 | 处理方式 |
-|---|---|---|
-| 图文 | 同一张图 | `edit_message_caption` 就地改图注，图不丢、不删消息 |
-| 图文 | 另一张图 | `edit_message_media` 原地换图 |
-| 图文 | 无图 | 删旧消息 → 发纯文字 |
-| 文字 | 有图 | 删旧消息 → 发图文（Telegram 不支持文→图就地转换） |
-| 文字 | 无图 | `edit_message_text` 就地改 |
-
-配套：
-- 新增 `pages_user.home_photo()`，`m:root` / `m:checkjoin` / 未知回调兜底三处回主界面都带它
-- 文案超过 1024 字符（caption 上限）时主动放弃带图，退回纯文字，避免编辑失败整页打不开
-- HTML 解析失败 / `Message is not modified` 的安全降级全部保留
+- `pages_user.home_photo()`：统一读取欢迎图 `file_id`，`m:root`、`m:checkjoin` 与未知回调兜底三处回主界面均带入。
+- 文案超过 1024 字符（caption 上限）时自动放弃带图，退回纯文字，避免编辑失败导致页面无法打开。
 
 ### 修复
 
-- **[充值] 普通充值入口（OkPay/KKPay）积分精度**
-  `points = int(amount * rate)` 走 float。`0.29 USDT @ 100 积分/U` 得 28（应为 29）、`0.57` 得 56、`0.58` 得 57。v2.6.2 只修了冷钱包入口，这个主入口漏了。
-  修法：`int(Decimal(str(amount)) * Decimal(str(rate)))`。
-
-- **[充值] 充值确认页与实付不一致**
-  `page_recharge_confirm` 同样用 `int(amount * rate)` 预览。页面上写「获得 100 积分」、实际入账 99，是最容易招投诉的一类不一致。
-  修法：与 `create_recharge` 用同一套 Decimal 算法。
-
-- **[资金安全] 提现审核「通过」缺少事务与 CAS**
-  `approve_withdrawal` 是「读 → 判断 status == pending → 写」，三步不在事务内。两个管理员同时点「通过」和「拒绝」时，拒绝方在事务里退回余额，通过方随后无条件覆盖成 `paid`——用户既拿到打款又拿回积分。
-  修法：`atomic()` + 新增 `set_withdrawal_status(expect="pending")` 做 CAS。
-
-- **[订单] 管理员回单未放事务**
-  `complete_order` 同样是读-改-写三分离，双击或两个管理员同时点会各写一次，用户收到两条回单通知。
-  修法：整体放进 `atomic()`。
-
-- **[后台] 自动备份开关无效**
-  `auto_backup()` 从未读取 `daily_backup_enabled`，管理员在面板关掉后照样每天 04:30 备份。
-  修法：循环内先判开关。
-
-- **[广播] 用户超过 1 万时静默漏人**
-  商品广播与供需广播都用 `list_users(limit=10000)`，第 10001 个之后的用户永远收不到，且没有任何报错。
-  修法：新增 `db.iter_users(batch=500)` 分批遍历，内存占用也更低。
-
-- **[补货] 按 username 找人只查前 500 个用户**
-  `for u in db.list_users(limit=500)` 线性比对，用户超 500 后新用户永远找不到。
-  修法：新增 `get_user_by_username()` 走 SQL 精确查询。
-
-- **[统计] 订单管理页总数显示错误**
-  `len(orders)` 是 `LIMIT 200` 截断后的长度，超过 200 单时显示「共 200 条」。
-  修法：改用 `count_orders()` 真实计数。
-
-- **[设置] 移除僵尸设置项 `order_expire_minutes`**
-  只在 `get_settings()` 里定义了默认值 30，全项目没有任何代码读取，界面上也没有开关。留着会让后人以为存在「订单超时自动取消」功能。
+- **普通充值入口积分精度**。`points = int(amount * rate)` 使用 float 计算，`0.29 USDT @ 100 积分/U` 得 28 分（应为 29）、`0.57` 得 56、`0.58` 得 57。v2.6.2 仅修复冷钱包入口，主入口遗漏。改为 `int(Decimal(str(amount)) * Decimal(str(rate)))`。
+- **充值确认页与实际入账不一致**。`page_recharge_confirm` 使用相同的 float 算法，页面显示「获得 100 积分」而实际入账 99，改为与 `create_recharge` 共用 Decimal 算法。
+- **提现审核「通过」缺少事务与 CAS**。`approve_withdrawal` 的读取、判断、写入三步不在事务内。当「通过」与「拒绝」并发执行时，拒绝方在事务内退回余额，通过方随后无条件覆盖为 `paid`，导致同一笔提现既完成打款又退回积分。改为 `atomic()` + `set_withdrawal_status(expect="pending")`。
+- **管理员回单未放入事务**。`complete_order` 同样为读改写分离，双击或两名管理员同时操作会各写入一次，用户收到两条回单通知。改为整体置于 `atomic()` 内。
+- **自动备份开关无效**。`auto_backup()` 未读取 `daily_backup_enabled`，面板关闭后仍每日 04:30 执行。循环内增加开关判断。
+- **广播用户数上限**。商品广播与供需广播使用 `list_users(limit=10000)`，用户数超过一万时后续用户不会收到且无任何提示。新增 `db.iter_users(batch=500)` 分批遍历。
+- **按用户名查找用户仅覆盖前 500 条**。补货提醒使用 `list_users(limit=500)` 线性比对，用户数超过 500 后新用户无法被找到。新增 `get_user_by_username()` 走 SQL 精确查询。
+- **订单管理页总数显示错误**。`len(orders)` 为 `LIMIT 200` 截断后的长度，订单超过 200 笔时显示「共 200 条」。改用 `count_orders()`。
+- 移除未实现的设置项 `order_expire_minutes`。该键仅在 `get_settings()` 中定义默认值，全项目无读取处，界面亦无对应开关。
 
 ### 性能
 
-- **强制关注检查加 60 秒缓存**
-  每点一次主菜单都要对所有强制频道调一次 `get_chat_member`（一次网络往返），配 3 个频道就是 3 次 API 调用。加 `(user_id, 频道ID元组)` → 结果的 TTL 缓存，频道变化时 key 自动失效。
+- 强制关注检查增加 60 秒 TTL 缓存，键为 `(user_id, 频道 ID 元组)`，频道配置变化时自动失效。原实现对每个强制频道各调用一次 `get_chat_member`，配置 3 个频道时每次进入主界面产生 3 次 Telegram API 请求。
 
-### 测试
-
-- `test_extra.py` 从 71 项扩到 **85 项**，新增 14 项专门验证欢迎图的六种媒体切换路径
-- `verify_issues.py` 从 43 项扩到 **47 项**，新增普通充值入口 4 种精度组合
-- 覆盖率 76% → **75%**（新增代码拉低，绝对行数从 0 到覆盖）
+### 验证
 
 ```
-test_bot_full.py        → ✅ 7207 项
-verify_issues.py        → ✅ 47 项
-test_extra.py           → ✅ 85 项
-test_coverage_boost.py  → ✅ 75 项
-ruff check              → All checks passed
+test_bot_full.py        7207 项
+verify_issues.py          47 项
+test_extra.py             85 项（新增 14 项覆盖欢迎图媒体切换路径）
+test_coverage_boost.py    75 项
+ruff check              All checks passed
 ```
 
 ---
 
-## v2.6.5 · 2026-10-21 · 覆盖率补强 + 一个真实缺陷
+## v2.6.5 · 2026-10-21
 
 ### 修复
 
-- **[抢单] `_toast()` 参数名不匹配，三处错误提示直接抛 TypeError**
+- **`_toast()` 参数名不匹配导致三处错误提示抛出 TypeError**。定义参数为 `alert`，三处调用传入 `show_alert`，触发 `TypeError: _toast() got an unexpected keyword argument 'show_alert'`。受影响位置：
 
-```python
-# 定义
-async def _toast(text: str, alert: bool = True) -> None: ...
-# 调用（3 处）
-await _toast(err or "生成失败", show_alert=True)
-```
+  | 位置 | 场景 |
+  |---|---|
+  | `gb:inv` | 专属入群链接生成失败 |
+  | `a:gblink` | 管理员重发接单员链接失败 |
+  | `a:gblink` | 链接生成成功但私聊发送失败 |
 
-`alert` 与 `show_alert` 不匹配 → `TypeError: _toast() got an unexpected keyword argument 'show_alert'`。
+  三处均为错误提示路径，异常被吞后用户仅看到按钮无响应。参数名改为与 Bot API `answerCallbackQuery(show_alert=...)` 一致，并增加 `**_ignored` 兼容历史别名。
 
-受影响的三条路径都是**错误提示**，也就是说「出了错要告诉用户」的那条路本身会炸：
+  该缺陷未被原有 7207 项自检覆盖，原因是自检中的模拟 Bot 始终成功返回，不会进入失败分支。
 
-| 位置 | 场景 |
-|---|---|
-| `gb:inv` | 专属入群链接生成失败 |
-| `a:gblink` | 管理员重发接单员链接失败 |
-| `a:gblink` | 链接生成成功但私聊发送失败 |
+### 新增
 
-用户看到的是「点了没反应」，而不是真实原因。修法：参数名对齐 Bot API 的 `answerCallbackQuery(show_alert=...)`，并加 `**_ignored` 兜住历史别名。
+- `test_coverage_boost.py`：75 项断言，覆盖供需全流程、抢单回调、后台任务、链上异常、输入状态机。
 
-这个 bug 是写 `test_coverage_boost.py` 时被测出来的——原来的 7207 项自检没覆盖到这三条失败分支。
-
-### 新增 test_coverage_boost.py（75 项）
-
-补之前完全没走到的模块：
-
-| 组 | 覆盖内容 |
-|---|---|
-| **供需全流程** | 发布扣费 / 空内容 / 超长 / 暂停 / 积分不足 / 封禁 / 日限 / 频道未配置 / 审核通过 / 审核拒绝退款 / 重复审核幂等 / bot 广播 / 频道发送失败退腿 / 删帖退款 / 统计 |
-| **抢单回调** | `gb:m` `gb:doing` `gb:done` `gb:money` `gb:wd` `gb:wdnew` `gb:inv` `gb:rank` `gb:aps` + 管理端 `a:grab` `a:gbers` `a:gbadd` `a:gords` `a:gwds` `a:gaps` `a:gset` |
-| **后台任务** | 5 个常驻协程各跑完一轮（把 `asyncio.sleep` 换成立即返回，第二轮抛 `CancelledError` 退出） |
-| **链上异常** | 网络异常 / 坏 JSON / 单条脏数据不影响整批 |
-| **输入状态机** | 无状态消息 / 群聊消息被忽略 / 搜索状态 / 未知状态清理 |
+  | 分组 | 覆盖内容 |
+  |---|---|
+  | 供需全流程 | 发布扣费、空内容、超长、暂停、积分不足、封禁、日限额、频道未配置、审核通过、审核拒绝退款、重复审核幂等、机器人广播、频道失败退腿、删帖退款、统计 |
+  | 抢单回调 | `gb:m` `gb:doing` `gb:done` `gb:money` `gb:wd` `gb:wdnew` `gb:inv` `gb:rank` `gb:aps`，管理端 `a:grab` `a:gbers` `a:gbadd` `a:gords` `a:gwds` `a:gaps` `a:gset` |
+  | 后台任务 | 5 个常驻协程各执行一轮 |
+  | 链上异常 | 网络异常、JSON 解析失败、单条脏数据不影响整批 |
+  | 输入状态机 | 无状态消息、群聊消息忽略、搜索状态、未知状态清理 |
 
 ### 覆盖率
 
-| 模块 | 之前 | 现在 |
+| 模块 | 调整前 | 调整后 |
 |---|---|---|
-| `supply_service.py` | 26% | **90%** |
-| `chain_watch.py` | 37% | **74%** |
+| `supply_service.py` | 26% | 90% |
+| `chain_watch.py` | 37% | 74% |
 | `cb_grab.py` | 34% | 48% |
-| `jobs.py` | 37% | 通过 |
-| **总计** | 71% | **76%** |
+| 总计 | 71% | 76% |
 
-CI 门槛从 70% 提到 **75%**。
+CI 覆盖率门槛由 70% 调整为 75%。
 
-### 测试策略上的两个坑（记录备查）
+### 说明
 
-1. **常驻协程不能直接 await**
-   `jobs.py` 里都是 `while True: await asyncio.sleep(N)`，直接 `await` 会永久挂住测试进程（实测卡到超时）。做法是 patch `asyncio.sleep` 成「第一次立即返回、第二次抛 `CancelledError`」，跑完一轮循环体后正常退出。
+常驻协程（`while True: await asyncio.sleep(N)`）无法直接 await，否则测试进程永久阻塞。处理方式为将 `asyncio.sleep` 替换为「第一次立即返回、第二次抛出 `CancelledError`」，执行完一轮循环体后正常退出。
 
-2. **后台任务的完成时间要按数据量算**
-   `_broadcast_bot` 是 `create_task`，每发一个用户 `sleep(0.05)`。测试库里 8 个用户 → 至少 0.4 秒，原来只等 0.3 秒，`bot_ok` 还没置位就断言了。改成按用户数估时。
-
-```
-test_bot_full.py          → ✅ 7207 项
-verify_issues.py          → ✅ 43 项
-test_extra.py             → ✅ 71 项
-test_coverage_boost.py    → ✅ 75 项
-ruff check                → All checks passed
-coverage                  → 76%
-```
+后台任务耗时需按数据量估算。`_broadcast_bot` 为 `create_task`，每个用户之间 `sleep(0.05)`，8 个用户至少需要 0.4 秒，测试等待时间不足时会在 `bot_ok` 置位前断言。
 
 ---
 
-## v2.6.4 · 2026-10-20 · 结构重构（数据层与回调分发拆分）
+## v2.6.4 · 2026-10-20
 
-纯重构，零行为变更。三个测试套件全绿，其中 7207 项业务断言一项未改即通过——这是「重构没改行为」的证明。
+纯结构重构，无行为变更。7207 项业务断言未经修改即通过。
 
-### 数据层：2639 行 God Class → 12 个领域 mixin
+### 数据层拆分
 
-`examples/models.py` 原本是单个 `Database` 类，102 个方法、2639 行，所有 SQL 全堆在一起。
+`examples/models.py` 原为单个 `Database` 类，102 个方法、2639 行。现拆分为 `examples/db/` 包：
 
-现在拆成 `examples/db/` 包：
-
-| mixin | 领域 | 方法数 |
+| 模块 | 领域 | 方法数 |
 |---|---|---|
-| `CoreMixin` | 连接 / 事务 / 建表 / 迁移 | 5 |
-| `UserMixin` | 用户 | 5 |
-| `ProductMixin` | 商品 | 5 |
-| `OrderMixin` | 订单 | 9 |
-| `RechargeMixin` | 充值单与链上防重 | 7 |
-| `AdminMixin` | 管理员 | 5 |
-| `ChannelMixin` | 频道 | 4 |
-| `SettingMixin` | 设置项 | 4 |
-| `PointMixin` | 积分流水与操作日志 | 5 |
-| `SupplyMixin` | 付费供需 | 6 |
-| `StockMixin` | 库存池与到货提醒 | 13 |
-| `GrabMixin` | 抢单派单 | 34 |
+| `mixins/core.py` | 连接、事务、建表、迁移 | 5 |
+| `mixins/user.py` | 用户 | 5 |
+| `mixins/product.py` | 商品 | 5 |
+| `mixins/order.py` | 订单 | 9 |
+| `mixins/recharge.py` | 充值单与链上防重 | 7 |
+| `mixins/admin.py` | 管理员 | 5 |
+| `mixins/channel.py` | 频道 | 4 |
+| `mixins/setting.py` | 设置项 | 4 |
+| `mixins/point.py` | 积分流水与操作日志 | 5 |
+| `mixins/supply.py` | 付费供需 | 6 |
+| `mixins/stock.py` | 库存池与到货提醒 | 13 |
+| `mixins/grab.py` | 抢单派单 | 34 |
 
-`Database` 变成多重继承门面，自身不再定义任何业务方法（有测试断言这一点）。`examples/models.py` 退化成 12 行兼容层，**所有 `from .models import ...` 调用点零改动**。
+`Database` 改为多重继承门面，自身不再定义业务方法。`base.py` 存放常量与工具函数，`schema.py` 存放全部 dataclass。分组依据为数据表：同一张表的读写集中在同一个 mixin，跨表事务仍在 `core.atomic()` 内完成。各 mixin 使用显式导入。
 
-分组唯一依据是「表」：同一张表的读写落在同一个 mixin，跨表事务仍在 `core.atomic()` 里完成。显式 import（不用星号），每个 mixin 只导入自己用到的名字。
+`examples/models.py` 保留为 12 行兼容层，全部 `from .models import ...` 调用点无需修改。
 
-### 回调分发：1919 行 if 链 → 4 个命名空间 dispatcher
+### 回调分发拆分
 
-`handlers_callback.py` 原本是一个函数、152 个 `if data.startswith(...)`。
-
-现在按回调命名空间拆成 4 个模块，入口只剩 78 行：
+`handlers_callback.py` 原为单一函数，152 个 `if data.startswith(...)` 分支，1919 行。现按回调命名空间拆分为四个模块：
 
 | 模块 | 命名空间 | 行数 |
 |---|---|---|
 | `cb_user.py` | `m:` `d:` `buy:` `cbuy:` `od:` `urge:` `redeliver:` `rsub:` `rc:` `rcpay:` `rcchk:` | 453 |
-| `cb_supply.py` | `sup:` `a:sup*`（供需大厅/发布向导/开关/审核） | 554 |
-| `cb_admin.py` | `padd_*` `a:*`（上架向导/商品/订单/用户/设置） | 644 |
-| `cb_grab.py` | `gb:` `a:g*`（抢单/接单员/提现/申诉） | 565 |
+| `cb_supply.py` | `sup:` `a:sup*` | 554 |
+| `cb_admin.py` | `padd_*` `a:*` | 644 |
+| `cb_grab.py` | `gb:` `a:g*` | 565 |
 
-分发方式是「顺序短路」：`_dispatch_xxx(...) -> bool`，返回 `True` 即命中，后续不再执行。分支逻辑逐字未改，只把裸 `return` 换成 `return True`。
+入口 `on_callback` 缩减至 78 行，按 `_dispatch_xxx(...) -> bool` 顺序短路分发，返回 `True` 即命中。分支逻辑逐字保留，仅将裸 `return` 替换为 `return True`。
 
-### 顺带把权限校验改成 fail-closed
+### 权限校验
 
-原实现的管理员校验是 `a:` 分支里的一行，位置在文件中部（原 695 行），而 `a:sup*`（供需管理，原 1173 行）排在它后面——原代码里两者顺序正确，校验有效。
-
-但这个正确性完全依赖「校验那行必须排在所有 `a:` 分支之前」这个隐式约定。拆成多模块后，`cb_supply` 在 `cb_admin` 之前执行，`a:sup*` 就绕过了校验——拆分过程中测试的 12 项越权断言立刻变红，正是这个原因。
-
-改成入口集中做 fail-closed 闸门，把隐式约定变成显式代码：
+原实现对 `a:` 前缀的管理员校验位于文件中部，正确性依赖「该行必须位于所有 `a:` 分支之前」这一隐式约定。拆分后 `cb_supply` 先于 `cb_admin` 执行，`a:sup*` 绕过校验。现改为入口集中判断：
 
 ```python
 if data.startswith("a:") and not db.is_admin(uid):
@@ -284,129 +196,80 @@ if data.startswith("a:") and not db.is_admin(uid):
     return
 ```
 
-这样以后新增任何 `a:` 前缀分支、调整任何 dispatcher 顺序，都不可能漏检。回归测试的 12 项越权断言（`a:prod` / `a:fin` / `a:sup` …）全部通过。
+### 新增
 
-### 新增 test_extra.py（71 项）
+`test_extra.py`：71 项断言，覆盖 UI 降级路径、供需定价边界、TRON 与 TON 地址校验、金额解析、门面完整性。
 
-补主自检没走到的分支：
+### 规模
 
-- **UI 降级路径**：HTML 解析失败 → 纯文本重发；`Message is not modified` → 静默忽略
-- **供需定价**：`both` = 两价之和 - 优惠、优惠大于总价时仍 >= 1、频道腿不为负、渠道可用性随配置变化
-- **地址校验**：TRON 长度/前缀/校验和三类错误、TON 长度/前缀/校验和、未知链拒绝
-- **金额解析**：6 位小数、超大金额、非法输入、负数
-- **门面完整性**：`Database` 继承各 mixin、自身零业务方法、`models.*` 全部名字仍可导入
+| 指标 | 重构前 | 重构后 |
+|---|---|---|
+| 最大文件 | `models.py` 2639 行 | `shop_service.py` 1202 行 |
+| 最大函数 | `on_callback` 1919 行 | `_dispatch_admin` 644 行 |
 
 ### 验证
 
 ```
-test_bot_full.py   → ✅ 7207 项通过，❌ 0 项（重构前后完全一致）
-verify_issues.py   → ✅ 43 项通过，❌ 0 项
-test_extra.py      → ✅ 71 项通过，❌ 0 项
-ruff check         → All checks passed!
-coverage           → 71%（CI 门槛 70%，低于则红）
+test_bot_full.py        7207 项（重构前后一致）
+verify_issues.py          43 项
+test_extra.py             71 项
+ruff check              All checks passed
+coverage                  71%
 ```
-
-### 规模对比
-
-| 项 | 重构前 | 重构后 |
-|---|---|---|
-| 最大文件 | `models.py` 2639 行 | `shop_service.py` 1202 行 |
-| 最大单函数 | `on_callback` 1919 行 | `_dispatch_admin` 644 行 |
-| `Database` 方法数 | 102（集中） | 102（分散在 12 个 mixin，每个 4~34） |
-| 函数返回注解覆盖 | 94% | 94%（拆出的新文件全 100%） |
 
 ---
 
-## v2.6.3 · 2026-10-20 · 尾数唯一性 + TON 协议对齐 + 补账通道
-
-第二批修复，issue #4 ~ #7。全部为「静默出错」型缺陷：不报错、不告警，钱错了也看不出来。
+## v2.6.3 · 2026-10-20
 
 ### 修复
 
-- **[资金安全] 待支付单超过 200 笔时 TRON 尾数重复分配**
-  `_alloc_tron_suffix()` 从 `list_pending_recharges()` 取占用集合，而这个方法 `ORDER BY created_at DESC LIMIT 200`。待支付单超过 200 笔后，更早的单不在列表里，尾数被重复分配，两笔不同订单生成完全相同的应付金额（如都分配 `10.001`），付款会记到别人账上。
-  修法：新增 `pending_tron_suffixes(base_amount)` 按「同一整数金额」全表扫描（不同整数金额不可能误匹配，可安全复用尾数）；`_alloc_tron_suffix(base_amount, conn)` 接收金额与事务连接。
-  另一个并发缺陷：原实现「先分配、后插入」在写锁前互相看不见，两个并发请求会分到同一尾数。现把分配与落库放进同一个 `BEGIN IMMEDIATE` 事务。
+- **待支付单超过 200 笔时 TRON 尾数重复分配**。`_alloc_tron_suffix()` 的占用集合来自 `list_pending_recharges()`，该方法为 `ORDER BY created_at DESC LIMIT 200`，第 201 笔及之后的订单不在集合内，尾数可被重复分配，两笔订单生成相同的应付金额，付款将记入错误账户。改为新增 `pending_tron_suffixes(base_amount)` 按整数金额全表扫描（不同整数金额不会产生相同应付金额，尾数可安全复用）。另将分配与落库合并至同一个 `BEGIN IMMEDIATE` 事务，原实现先分配后插入，写锁获取前互相不可见，并发时会分配到相同尾数。
+- **TON 解析与 TonCenter v3 协议不兼容**。三处独立错误叠加，导致 TON 充值无法自动入账：
 
-- **[充值] TON 解析与 TonCenter v3 实际协议不兼容**
-  三个独立错误叠加，导致 TON 充值**从来不会自动入账**：
-  1. 收币方参数写成 `destination_wallet`，官方是 `owner_address`（配 `direction=in`）。错参数被静默忽略，返回任意地址的转账。
-  2. 响应 `jetton_master` 是 raw 格式（`0:B113A9...`），代码拿 friendly 常量（`EQCxE6mU...`）直接比，**永不相等**，所有记录被过滤。
-  3. 备注在 `decoded_forward_payload.comment`，代码读顶层 `comment`，永远拿到空串。
-  修法：参数改 `owner_address`；新增 `ton_normalize_address()` 把 friendly/raw 统一成 `workchain:HEX64` 再比较；备注按 `decoded_forward_payload.comment` 优先、顶层 `comment` 兜底；额外检查 `transaction_aborted`（失败交易不入账）与 `destination`（双保险核对收款方）。
+  | 问题 | 原实现 | 修正 |
+  |---|---|---|
+  | 收币方参数 | `destination_wallet` | `owner_address`（配合 `direction=in`） |
+  | 地址格式 | `jetton_master` 响应为 raw 格式 `0:B113A994...`，与 friendly 常量 `EQCxE6mU...` 直接比较，恒不相等 | 新增 `ton_normalize_address()` 统一转为 `workchain:HEX64` |
+  | 备注字段 | 读取顶层 `comment` | 读取 `decoded_forward_payload.comment` |
 
-- **[充值] 超时订单未查账即标失败，已付款订单永久丢失**
-  `check_all_pending_recharges()` 对超过 2 小时的单直接 `status = "failed"` 后跳过；`check_recharge_status()` 又只接受 `pending`。服务停机、支付接口故障、队列拥堵期间用户已付款的单，从此没有任何补账途径。
-  修法：标 failed 之前先查一次账，查到即入账；`check_recharge_status(..., allow_failed=True)` 允许 failed 单补记；管理员/用户点「查询支付状态」时传 `allow_failed=True`。
-
-- **[资金安全] 供需分发失败退款按当前价格，调价后可超额退款**
-  `_refund_channel_leg()` 用 `channel_leg_value(post.channel)` 实时算价。原扣 1 分、管理员把频道价调到 100 后分发失败，会退 100 分（余额 100 → 199）。
-  修法：`SupplyPost` 新增 `channel_leg` 字段，发帖时快照实付金额；退款优先取快照，老数据（0）回退旧口径，且 `min(amount, post.cost)` 硬性封顶，退款绝不超过实付总额。配套迁移：老库自动 `ALTER TABLE supply_posts ADD COLUMN channel_leg`。
+  同时增加 `transaction_aborted` 判断（失败交易不入账）与 `destination` 校验。
+- **超时订单未查账即标记失败**。`check_all_pending_recharges()` 对超过 2 小时的订单直接置为 `failed` 并跳过查询，`check_recharge_status()` 仅接受 `pending` 状态。服务停机或支付接口故障期间已付款的订单因此无法补记。改为标记失败前先查询一次，并新增 `allow_failed` 参数保留补账通道。
+- **供需分发失败退款按当前价格计算**。`_refund_channel_leg()` 调用 `channel_leg_value()` 实时取价，原扣 1 分、管理员将频道价调整为 100 后分发失败会退还 100 分。`SupplyPost` 新增 `channel_leg` 字段保存发帖时的实付金额，退款优先取快照，并以 `min(amount, post.cost)` 封顶。配套迁移：`ALTER TABLE supply_posts ADD COLUMN channel_leg INTEGER DEFAULT 0`。
 
 ### 测试
 
-- `verify_issues.py` 从 21 项扩到 **43 项**，覆盖 #1 ~ #7 全部七个缺陷。每项都先断言「修复前的行为确实会出错」，再断言修复后正确——避免出现「测试通过但 bug 仍在」的假绿。
-- `test_bot_full.py` 两处 mock 补 `allow_failed` 参数，7207 项全绿。
-
-```
-python3 test_bot_full.py   → ✅ 7207 项通过，❌ 0 项
-python3 verify_issues.py   → ✅ 43 项通过，❌ 0 项
-ruff check                 → All checks passed!
-```
+`verify_issues.py` 由 21 项扩展至 43 项，覆盖 #1 至 #7 全部缺陷。每项先断言修复前行为确实出错，再断言修复后正确。
 
 ---
 
-## v2.6.2 · 2026-10-20 · 资金安全修复 + 工程化
-
-本次为缺陷修复与工程规范补强，不含新功能。三个资金/风控级缺陷来自公开 issue，全部附回归用例。
+## v2.6.2 · 2026-10-20
 
 ### 修复
 
-- **[资金安全] 自动解冻与手动解冻交错执行导致佣金重复入账**
-  `release_due_commissions()` 一次性读取到期佣金后逐笔处理，在发送 Telegram 通知处 `await` 让出执行权。若管理员此时手动解冻了尚未处理的佣金，自动任务恢复后无条件执行 `UPDATE grab_commissions SET status='released'` 并再次增加 `balance_available`，同一笔佣金被计两次（100 → 300）。
-  修法：`set_commission_status()` 增加 `expect` 参数做 CAS，`WHERE id=? AND status=?`，`rowcount == 0` 直接跳过记账。手动解冻同样走 CAS，连点两次也只生效一次。
-
-- **[资金安全] 手动解冻受列表分页限制**
-  `release_commission_manual()` 用 `list_grab_commissions(status="frozen", limit=500)` 再线性查找目标，冻结记录超过 500 笔后更早的佣金永远解冻不了。
-  修法：新增 `get_grab_commission(cid)` 按主键取单。
-
-- **[充值] TRON 监听缺分页与时间游标**
-  TronGrid 查询固定 `limit=50` + `order_by=block_timestamp,asc`，调用处既不传 `min_timestamp` 也不翻页。地址历史匹配转账超过 50 笔后，每轮都反复读最早一页，新充值永远进不来。
-  修法：按 `meta.fingerprint` 循环翻页（最多 5 页）；游标持久化到 settings（`tron_scan_cursor_ms` / `ton_scan_cursor_ms`），每轮只扫游标之后，起点取「游标」与「最早待支付单前 10 分钟」更早者并回退 60 秒重叠，兼顾增量与不漏单。TON 侧同步加 `start_utime`。
-
-- **[风控] `run_polling()` 未显式订阅 `chat_member`**
-  Bot API 的默认更新集合明确不含 `chat_member`（官方文档：空 `allowed_updates` 表示除 `chat_member` / `message_reaction` / `message_reaction_count` 外的全部）。项目注册了 `ChatMemberHandler.CHAT_MEMBER` 却从未声明订阅，导致退群停权、专属入群链接校验、入群识别这些风控逻辑在新部署上静默失效。
-  修法：`run_polling(allowed_updates=ALLOWED_UPDATES)`，显式列出 MESSAGE / CALLBACK_QUERY / CHAT_MEMBER / MY_CHAT_MEMBER。
-
-- **[金额] 充值积分换算精度**
-  `int(pay_amount * rate)` 走 float。穷举 0.001~0.999 尾数 × 常见汇率，`0.29 / 0.57 / 0.58` 在 rate=100 时 `int()` 少算 1 积分（`float("0.29") * 100 == 28.999999999999996`）。
-  修法：`int(Decimal(str(amount)) * Decimal(str(rate)))`。
-
-- **[金额] 提现汇率银行家舍入**
-  `round(points / rate, 2)` 是银行家舍入，2.5 会进成 2，少付 0.5 USDT。
-  修法：`Decimal.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)`。
-
-- **[金额] 限额校验改 Decimal**
-  `validate_recharge_amount` 的 min/max 比较改 Decimal，避免边界值因浮点误差漂移。
+- **佣金解冻竞态导致重复入账**。`release_due_commissions()` 读取到期佣金后逐笔处理，在发送 Telegram 通知处 `await` 让出执行权。若管理员此时手动解冻了尚未处理的佣金，自动任务恢复后无条件执行 `UPDATE` 并再次增加可提现余额，同一笔佣金计入两次（100 → 300）。`set_commission_status()` 增加 `expect` 参数实现 CAS，`rowcount == 0` 时跳过记账。
+- **手动解冻受列表分页限制**。`release_commission_manual()` 使用 `list_grab_commissions(status="frozen", limit=500)` 再线性查找，冻结记录超过 500 笔后更早的佣金无法解冻。新增 `get_grab_commission(cid)` 按主键取单。
+- **TRON 监听缺少分页与时间游标**。查询固定 `limit=50` 与 `order_by=block_timestamp,asc`，调用处未传 `min_timestamp` 且未翻页。地址历史匹配转账超过 50 笔后，每轮轮询重复读取最早一页，新转账无法进入匹配流程。改为按 `meta.fingerprint` 翻页（最多 5 页），游标持久化至 settings（`tron_scan_cursor_ms` / `ton_scan_cursor_ms`），扫描起点取「游标」与「最早待支付单前 10 分钟」中较早者并回退 60 秒。TON 侧同步增加 `start_utime`。
+- **`run_polling()` 未显式订阅 `chat_member`**。Bot API 的默认更新集合不包含 `chat_member`，项目虽注册 `ChatMemberHandler.CHAT_MEMBER` 但未声明订阅，导致退群停权、专属入群链接校验、入群识别在新部署上无效。改为 `run_polling(allowed_updates=ALLOWED_UPDATES)`，显式列出 `MESSAGE`、`CALLBACK_QUERY`、`CHAT_MEMBER`、`MY_CHAT_MEMBER`。
+- **充值积分换算精度**。`int(pay_amount * rate)` 使用 float，`0.29`、`0.57`、`0.58` 在 rate=100 时少算 1 积分（`float("0.29") * 100 == 28.999999999999996`）。改为 `int(Decimal(str(amount)) * Decimal(str(rate)))`。
+- **提现汇率银行家舍入**。`round(points / rate, 2)` 采用银行家舍入，2.5 进位为 2，少付 0.5 USDT。改为 `Decimal.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)`。
+- **限额校验改用 Decimal**。`validate_recharge_amount` 的最小值与最大值比较改为 Decimal，避免浮点误差导致边界判断偏移。
 
 ### 工程化
 
-- **依赖锁版本**：`>=` → `==`（python-telegram-bot 22.8 / python-dotenv 1.2.4 / httpx 0.28.1）。PTB 21→22 有破坏性变更，`>=` 是定时炸弹。
-- **新增 CI**（`.github/workflows/ci.yml`）：Python 3.10 / 3.11 / 3.12 三版本矩阵，跑 ruff → 语法编译 → 7200+ 项自检 → 回归测试 → 导入烟雾测试。
-- **新增 `pyproject.toml`**：项目元数据 + ruff 规则（E/F/W/I/UP/B，行长 120）。
-- **新增 `verify_issues.py`**：本次三个 issue 的回归用例，21 项断言，全离线（临时 SQLite + HTTP stub）。
-- **清理 30 处 lint 问题**：未使用导入 26 处、未使用变量 3 处、无占位符 f-string 4 处；顺带删掉 `page_admin_grabbers` 里 4 次无人使用的 `COUNT(*)` 查询。
-- **移除硬编码管理员 ID**：`runtime.py` 的 `ADMIN_ID` 默认值从真实 ID 改为 `0`，必须由 `.env` 提供。
+- 依赖锁定版本：`python-telegram-bot==22.8`、`python-dotenv==1.2.4`、`httpx==0.28.1`。
+- 新增 CI（`.github/workflows/ci.yml`）：Python 3.10 / 3.11 / 3.12 矩阵，依次执行 ruff、语法编译、7207 项自检、回归测试、导入烟雾测试。
+- 新增 `pyproject.toml`：项目元数据与 ruff 规则（E / F / W / I / UP / B，行宽 120）。
+- 新增 `verify_issues.py`：21 项断言，使用临时 SQLite 与 HTTP stub，全程离线。
+- 清理 30 处 lint 问题。
+- 移除硬编码管理员 ID，改为必须由 `.env` 提供。
 
 ### 验证
 
 ```
-python3 test_bot_full.py   → ✅ 7207 项通过，❌ 0 项
-python3 verify_issues.py   → ✅ 21 项通过，❌ 0 项
-ruff check main.py examples → All checks passed!
+test_bot_full.py        7207 项
+verify_issues.py          21 项
+ruff check              All checks passed
 ```
-
----
 
 ---
 
