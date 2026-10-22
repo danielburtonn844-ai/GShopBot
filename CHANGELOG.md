@@ -75,27 +75,6 @@ ruff check              → All checks passed
 
 ---
 
-## v2.6.6.1 · 2026-10-21 · 发版流程：预热 OG 预览图
-
-Telegram 分享 GitHub Release 链接时不显示缩略图。**不是链接坏了，是抓取时机。**
-
-GitHub 的 Release 卡片图走 `opengraph.githubassets.com/<hash>/...`，**懒生成**：第一次有人请求才渲染，通常要几十秒。分享发生在渲染完成之前，抓取方拿到 404，然后把这個 URL 缓存成「无图」，之后一直不显示。v2.6.4 因为分享得晚所以有图，v2.6.6 刚发就分享所以没图。
-
-新增 `scripts/warm_og.py`：发完 Release 立刻跑一次，先触发渲染再轮询到 200 且体积正常，确认就绪后才给分享链接。
-
-```bash
-python3 scripts/warm_og.py --tag v2.6.7
-# [1/2] 读取 Release 页面
-#       og:image = https://opengraph.githubassets.com/.../v2.6.7
-# [2/2] 预热预览图
-#       ✓ 第 1 次就绪：HTTP 200，122867 字节（1s）
-# ✅ 可以分享了
-```
-
-已经发出去且没图的链接：发给 Telegram 官方 **@WebpageBot** 强制刷新缓存。
-
----
-
 ## v2.6.6 · 2026-10-21 · 欢迎图常驻 + 五个静默缺陷
 
 ### 功能：主界面欢迎图不再消失（参照扎堆号铺的媒体感知更新）
