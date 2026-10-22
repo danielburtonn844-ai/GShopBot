@@ -29,7 +29,7 @@ jobs:
       - name: Lint (ruff)
         run: |
           pip install ruff
-          ruff check main.py examples verify_issues.py test_extra.py test_coverage_boost.py
+          ruff check main.py examples verify_issues.py test_extra.py test_coverage_boost.py bench_concurrency.py scripts
 
       - name: Syntax check
         run: python -m compileall -q main.py examples verify_issues.py
@@ -45,6 +45,9 @@ jobs:
 
       - name: Deep coverage tests
         run: python test_coverage_boost.py
+
+      - name: Concurrency bench (real lock contention)
+        run: python bench_concurrency.py
 
       - name: Coverage (fail under 75%)
         run: |

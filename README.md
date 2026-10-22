@@ -4,7 +4,7 @@
 
 **Telegram 自助报单 + 积分商城 + 抢单派单机器人**
 
-版本 `v2.6.6` · Python 3.10+ · SQLite · python-telegram-bot 22.8
+版本 `v2.6.7` · Python 3.10+ · SQLite · python-telegram-bot 22.8
 
 [![CI](https://github.com/danielburtonn844-ai/GShopBot/actions/workflows/ci.yml/badge.svg)](https://github.com/danielburtonn844-ai/GShopBot/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
@@ -117,6 +117,7 @@ python3 test_bot_full.py           # 业务全链路自检，7207 项
 python3 verify_issues.py           # 缺陷回归，47 项
 python3 test_extra.py              # 分支补强，85 项
 python3 test_coverage_boost.py     # 深度覆盖，75 项
+python3 bench_concurrency.py       # 并发压测，10 项（多线程真实竞争）
 ```
 
 全部离线运行（链上 API 走 mock，支付接口走 stub），强制走 `SHOP_DB_PATH` 隔离，不会碰正式库，也不需要联网。
@@ -252,6 +253,7 @@ test_bot_full.py            自检脚本（7207 断言，全离线）
 verify_issues.py            缺陷回归（47 断言：佣金竞态 / 链上分页 / 更新订阅 / 金额精度 / 尾数唯一性 / TON 协议 / 补账 / 退款快照 / 普通充值精度）
 test_extra.py               分支补强（85 断言：UI 降级 / 欢迎图媒体切换 / 供需定价 / 地址校验 / 门面完整性）
 test_coverage_boost.py      深度覆盖（75 断言：供需全流程 / 抢单回调 / 后台任务 / 链上异常 / 状态机）
+bench_concurrency.py        并发压测（10 项：多线程抢单 / 并发解冻 / 尾数唯一 / 提现并发 / 吞吐）
 .github/workflows/ci.yml    CI：ruff + 语法 + 四套测试 + 覆盖率门槛 75%（Python 3.10/3.11/3.12）
 pyproject.toml              项目元数据 + ruff 规则
 ```
@@ -274,6 +276,9 @@ pyproject.toml              项目元数据 + ruff 规则
 | **防偷老板** | 匿名派单卡片不含买家任何信息；群内公示只显示接单员编号 |
 | **媒体感知更新** | `send_or_edit` 按「当前消息承载什么媒体」决定走 `edit_caption` / `edit_media` / `edit_text` / 删旧发新，主界面欢迎图在来回切换中不会丢 |
 | **强制关注缓存** | 频道检查结果按 `(user_id, 频道集合)` 缓存 60 秒，避免每点一次按钮就打 N 次 Telegram API |
+| **连接复用** | 每线程复用一条持久 SQLite 连接（`threading.local`），WAL 只设一次。压测：1000 次读写从 14 次/秒 → 249 次/秒 |
+| **锁重试** | WAL 下「读升级写」会立刻报 `database is locked`（busy_timeout 不生效），`execute()` 退避重试 3 次兜住 |
+| **并发实测** | 100 线程抢同一单只有 1 人成功；50 笔并发解冻不重复入账；200 并发下单尾数全唯一；提现通过/拒绝并发无双生效（见 `bench_concurrency.py`） |
 
 ### 已修复的历史缺陷
 

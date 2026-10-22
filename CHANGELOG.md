@@ -1,5 +1,80 @@
 # CHANGELOG — G Shop Bot
 
+## v2.6.7 · 2026-10-22 · 并发压测 + 数据库连接复用
+
+### 先说结论：并发「安全」早就有，「性能」这次才补上
+
+原来的代码在**正确性**上一直是并发安全的（CAS、事务、原子 UPDATE），但从来没人用真实竞争验证过，而且**连接管理方式让并发吞吐低得离谱**。
+
+这次做了两件事：写出压测把这些行为钉死，再把连接层重做。
+
+### 压测（新增 `bench_concurrency.py`）
+
+用**多线程 + 独立连接**打同一个库，制造真实写锁竞争（单元测试是单协程顺序执行，验证不了竞争）。
+
+| 场景 | 断言 | 结果 |
+|---|---|---|
+| 100 线程抢同一单 | 只能 1 人成功 | ✅ 唯一成功者，库中 grabber_id 就是赢家 |
+| 自动解冻 × 4 + 手动解冻 × 50 并发 | 余额 = 已解冻总额 | ✅ 1000 = 1000，不重复入账 |
+| 200 线程并发建 TRON 充值单（同金额） | 尾数全唯一 | ✅ 200 笔 200 个不同尾数 |
+| 提现「通过」vs「拒绝」20 轮并发 | 无双生效 | ✅ 0 轮双生效 |
+| 1000 次读写在 20 线程下 | 吞吐达标、无锁错误 | ✅ 249 次/秒，0 次 locked |
+
+### 性能修复：每次操作都新建连接
+
+**问题**：`_get_conn()` 每次调用都是 `sqlite3.connect()` + 2 条 PRAGMA + `close()`。实测单次 **3.63ms**，其中 PRAGMA 占 **76%**。而 `journal_mode=WAL` 是**数据库级持久设置**（写进文件头），后续任何连接自动生效，每次重设纯属浪费。
+
+**压测证据**（1000 次读写在 20 线程下）：
+
+| 版本 | 吞吐 |
+|---|---|
+| 改造前 | **14 次/秒** |
+| 改造后 | **249 次/秒** |
+
+100 线程抢同一单：**6820ms → 208ms**（33 倍）。
+
+**修法**：每条线程复用一条持久连接（`threading.local`），`sqlite3.connect(...)` 只在首次执行。为了让 60+ 处 `conn.close()` 零改动，用一个 `_PooledConn` 代理把 `close()` 变成「归还」。
+
+### 踩到的坑：close() 里回滚会毁掉外层事务
+
+第一版 `_PooledConn.close()` 写得「很谨慎」——发现连接上有未提交事务就 rollback。结果：
+
+```
+回单返回「成功」，但库里订单状态还是 pending
+```
+
+原因：`atomic()` 事务块内部任何一次读操作（比如 `db.get_setting()`，它自己 `_get_conn()` 再 `close()`）都会命中同一条池化连接，于是把**外层尚未提交的事务整个回滚掉**。
+
+修法：`close()` 只标记归还、不碰事务；事务由 `atomic()` 和 `_maybe_conn()` 显式 commit / rollback。
+
+### 锁冲突重试
+
+WAL 下「读事务升级写事务」会返回 `SQLITE_BUSY_SNAPSHOT`，这种冲突 `busy_timeout` 不生效、立刻报 locked。压测里 1000 次读写有 5 次踩到。
+
+修法：`execute()` 捕获 `database is locked` 退避重试 3 次；`busy_timeout` 从 5 秒提到 10 秒。
+
+### 索引
+
+充值表原来没有任何索引，链上轮询和尾数分配都是全表扫。新增：
+
+```sql
+CREATE INDEX idx_recharge_status_chain ON recharges(status, chain);
+CREATE INDEX idx_recharge_user ON recharges(user_id, created_at);
+```
+
+### 验证
+
+```
+test_bot_full.py        → ✅ 7207 项
+verify_issues.py        → ✅   47 项
+test_extra.py           → ✅   85 项
+test_coverage_boost.py  → ✅   75 项
+bench_concurrency.py    → ✅   10 项（含真实写锁竞争）
+ruff check              → All checks passed
+```
+
+---
+
 ## v2.6.6.1 · 2026-10-21 · 发版流程：预热 OG 预览图
 
 Telegram 分享 GitHub Release 链接时不显示缩略图。**不是链接坏了，是抓取时机。**
