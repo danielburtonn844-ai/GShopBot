@@ -42,7 +42,7 @@ for _suffix in ("", "-wal", "-shm"):
         os.remove(_p)
 os.environ["SHOP_DB_PATH"] = TEST_DB  # 必须在导入 runtime 之前设置才生效
 
-from examples import (  # noqa: E402
+from gshop import (  # noqa: E402
     handlers_callback,
     handlers_command,
     handlers_message,
@@ -52,12 +52,12 @@ from examples import (  # noqa: E402
     pages_supply,
     pages_user,
 )
-from examples.jobs import build_daily_report, do_backup  # noqa: E402
-from examples.models import LOCAL_TZ, TAGS, now_iso  # noqa: E402
-from examples.okpay import OkPay, build_base_string, flatten_params, sign_params  # noqa: E402
-from examples.runtime import db, grab, service, stock  # noqa: E402
-from examples.shop_service import BUY_FAIL_REASONS  # noqa: E402
-from examples.ui import audit  # noqa: E402
+from gshop.jobs import build_daily_report, do_backup  # noqa: E402
+from gshop.models import LOCAL_TZ, TAGS, now_iso  # noqa: E402
+from gshop.okpay import OkPay, build_base_string, flatten_params, sign_params  # noqa: E402
+from gshop.runtime import db, grab, service, stock  # noqa: E402
+from gshop.shop_service import BUY_FAIL_REASONS  # noqa: E402
+from gshop.ui import audit  # noqa: E402
 
 # ---- main 兼容命名空间：历史用例写作 main.xxx，这里把各模块的页面/处理器聚合进来 ----
 main = types.SimpleNamespace()
@@ -758,9 +758,11 @@ async def run():
     check("积分不足不进提交步骤", "state" not in ctx.user_data)
     p_so = service.create_product({"name": "售罄报单", "points": 10, "kind": "report", "stock": 0})
     ctx = FakeContext()
+    # 审计 P2-17：报单类不占库存，stock=0 的报单也能正常进入提交步骤
     res, ctx = await fire_callback(USER1, f"cbuy:{p_so.id}", ctx)
-    check("报单售罄拦截", res and "已售罄" in res[1])
-    check("售罄不进提交步骤", "state" not in ctx.user_data)
+    check("报单不查库存，可进入提交步骤",
+          ctx.user_data.get("state") == f"submit_info:{p_so.id}", str(ctx.user_data.get("state")))
+    ctx.user_data.pop("state", None)
 
     # 提交瞬间二次校验：进入提交步骤后积分被扣光，发送信息应下单失败且不扣库存
     p_mid = service.create_product({"name": "中价报单", "points": 350, "kind": "report", "stock": -1})
@@ -793,8 +795,12 @@ async def run():
     check("原因码 sold_out", o_none is None and reason == "sold_out", str(reason))
     o_none, reason = service.create_order(USER1, p_exp.id)
     check("原因码 points", o_none is None and reason == "points", str(reason))
-    o_none, reason = service.create_order(USER1, p_so.id)
-    check("售罄报单原因码 sold_out", o_none is None and reason == "sold_out", str(reason))
+    # 审计 P2-17：报单类不占库存，stock=0 也能下单，且不改变产品库存
+    stock_before = db.get_product(p_so.id).stock
+    o_rep, reason = service.create_order(USER1, p_so.id, note="报单测试")
+    check("售罄报单可下单", o_rep is not None, str(reason))
+    check("报单不消耗库存", db.get_product(p_so.id).stock == stock_before,
+          f"{stock_before} -> {db.get_product(p_so.id).stock}")
     check("原因码全部有中文文案", all(k in main.BUY_FAIL_REASONS for k in ("not_found", "sold_out", "limit", "banned", "points")))
 
     # check_purchase 只读校验：不扣积分、不建单
@@ -840,7 +846,7 @@ async def run():
     check("到账积分入账", after == before + rc.points, f"{before} -> {after} (+{rc.points})")
     recs2 = db.list_point_records(USER2, limit=50)
     check("充值产生流水", any("充值" in r.reason and r.ref == rc.id and r.change == rc.points for r in recs2))
-    check("累计充值统计", abs(db.get_user(USER2).total_recharge - 10.0) < 1e-9)
+    check("累计充值统计", abs(float(db.get_user(USER2).total_recharge) - 10.0) < 1e-9)
     # 重复确认同一单不会重复入账
     again = service.complete_recharge(rc.id)
     check("重复确认幂等", again is None and db.get_user(USER2).points == after)
@@ -1172,8 +1178,8 @@ async def run():
     import time as _time
     from decimal import Decimal as _Dec
 
-    import examples.shop_service as _ss_mod
-    from examples.chain_watch import ChainTx, is_valid_ton, is_valid_tron
+    import gshop.shop_service as _ss_mod
+    from gshop.chain_watch import ChainTx, is_valid_ton, is_valid_tron
 
     # --- 地址校验算法 ---
     TRON_ADDR = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"   # USDT-TRC20 合约地址（真地址）

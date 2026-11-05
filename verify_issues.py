@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import ast
 import asyncio
 import os
 import sys
@@ -37,8 +38,8 @@ def test_issue1() -> None:
     tmp = tempfile.mkdtemp()
     os.environ["SHOP_DB_PATH"] = os.path.join(tmp, "t1.db")
 
-    from examples.grab_service import GrabService
-    from examples.models import Database, Grabber, GrabCommission, now_iso
+    from gshop.grab_service import GrabService
+    from gshop.models import Database, Grabber, GrabCommission, now_iso
 
     db = Database(os.environ["SHOP_DB_PATH"])
     svc = GrabService(db, None)
@@ -93,7 +94,7 @@ def test_issue1() -> None:
 # ==================================================================
 def test_issue2() -> None:
     print("\n=== Issue #2：TRON 分页与时间游标 ===")
-    import examples.chain_watch as cw
+    import gshop.chain_watch as cw
 
     calls: list[dict] = []
 
@@ -163,9 +164,34 @@ def test_issue3() -> None:
 
     check("run_polling 传入 allowed_updates",
           "allowed_updates=ALLOWED_UPDATES" in src)
-    # v2.7.1（N-P2-5）：默认串行处理 update 会被单个慢请求堵死
-    check("run_polling 开启 concurrent_updates",
-          "concurrent_updates=True" in src)
+    # v2.7.1（N-P2-5）：默认串行处理 update 会被单个慢请求堵死。
+    # v2.8.0 修正：concurrent_updates 是 ApplicationBuilder 的方法，不是
+    # run_polling 的参数。写成 run_polling(concurrent_updates=True) 会在
+    # 启动最后一行抛 TypeError（unexpected keyword argument），进程直接退出。
+    check("builder 链上开启 concurrent_updates",
+          ".concurrent_updates(True)" in src)
+    # 用 AST 真解析 main()，只看真实的调用参数，不误命中注释文本
+    tree = ast.parse(src)
+    run_calls = [
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr == "run_polling"
+    ]
+    check("main.py 里只有一处 run_polling", len(run_calls) == 1, len(run_calls))
+    kw = {k.arg for k in run_calls[0].keywords} if run_calls else set()
+    check("run_polling 不误传 concurrent_updates", "concurrent_updates" not in kw, kw)
+    builder_calls = [
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr == "concurrent_updates"
+    ]
+    check("ApplicationBuilder.concurrent_updates(True) 被调用",
+          len(builder_calls) == 1
+          and builder_calls[0].args
+          and isinstance(builder_calls[0].args[0], ast.Constant)
+          and builder_calls[0].args[0].value is True)
     check("订阅了 CHAT_MEMBER", "Update.CHAT_MEMBER" in src)
     check("订阅了 MY_CHAT_MEMBER", "Update.MY_CHAT_MEMBER" in src)
     check("订阅了 MESSAGE", "Update.MESSAGE" in src)
@@ -183,7 +209,7 @@ def test_money() -> None:
     print("\n=== 附加：金额精度 ===")
     from decimal import Decimal
 
-    from examples.grab_service import GrabService
+    from gshop.grab_service import GrabService
 
     class FakeDB:
         def __init__(self):
@@ -198,13 +224,13 @@ def test_money() -> None:
     svc = GrabService.__new__(GrabService)
     svc.db = FakeDB()
     svc.settings["grab_points_per_usdt"] = 200
-    check("500 积分 @200 汇率 = 2.5", svc.points_to_usdt(500) == 2.5,
+    check("500 积分 @200 汇率 = 2.5", float(svc.points_to_usdt(500)) == 2.5,
           f"实际 {svc.points_to_usdt(500)}")
     svc.db.s["grab_points_per_usdt"] = 100
-    check("1234 积分 @100 汇率 = 12.34", svc.points_to_usdt(1234) == 12.34,
+    check("1234 积分 @100 汇率 = 12.34", float(svc.points_to_usdt(1234)) == 12.34,
           f"实际 {svc.points_to_usdt(1234)}")
     svc.db.s["grab_points_per_usdt"] = 3
-    check("1 积分 @3 汇率 = 0.33（四舍五入非截断）", svc.points_to_usdt(1) == 0.33,
+    check("1 积分 @3 汇率 = 0.33（四舍五入非截断）", float(svc.points_to_usdt(1)) == 0.33,
           f"实际 {svc.points_to_usdt(1)}")
 
     # 充值积分换算：float 会少算 1 积分的老坑
@@ -224,8 +250,8 @@ def test_issue4() -> None:
 
     tmp = tempfile.mkdtemp()
     os.environ["SHOP_DB_PATH"] = os.path.join(tmp, "t4.db")
-    from examples.models import Database, Recharge, now_iso
-    from examples.shop_service import ShopService
+    from gshop.models import Database, Recharge, now_iso
+    from gshop.shop_service import ShopService
 
     db = Database(os.environ["SHOP_DB_PATH"])
     svc = ShopService(db, None)
@@ -273,7 +299,7 @@ def test_issue4() -> None:
 # ==================================================================
 def test_issue5() -> None:
     print("\n=== Issue #5：TON 解析协议对齐 ===")
-    import examples.chain_watch as cw
+    import gshop.chain_watch as cw
 
     MASTER_FRIENDLY = cw.USDT_TON_MASTER
     MASTER_RAW = "0:B113A994B5024A16719F69139328EB759596C38A25F59028B146FECDC3621DFE"
@@ -365,8 +391,8 @@ def test_issue6() -> None:
     os.environ["SHOP_DB_PATH"] = os.path.join(tmp, "t6.db")
     from datetime import datetime, timedelta
 
-    from examples.models import LOCAL_TZ, Database, Recharge, now_iso
-    from examples.shop_service import ShopService
+    from gshop.models import LOCAL_TZ, Database, Recharge, now_iso
+    from gshop.shop_service import ShopService
 
     db = Database(os.environ["SHOP_DB_PATH"])
     svc = ShopService(db, None)
@@ -446,8 +472,8 @@ def test_issue7() -> None:
     print("\n=== Issue #7：供需退款按实付快照 ===")
     tmp = tempfile.mkdtemp()
     os.environ["SHOP_DB_PATH"] = os.path.join(tmp, "t7.db")
-    from examples.models import Database, SupplyPost, User, now_iso
-    from examples.supply_service import SupplyService
+    from gshop.models import Database, SupplyPost, User, now_iso
+    from gshop.supply_service import SupplyService
 
     db = Database(os.environ["SHOP_DB_PATH"])
     svc = SupplyService(db, None)
@@ -490,8 +516,8 @@ def test_recharge_points() -> None:
     tmp = tempfile.mkdtemp()
     os.environ["SHOP_DB_PATH"] = os.path.join(tmp, "t8.db")
 
-    from examples.db import Database
-    from examples.shop_service import ShopService
+    from gshop.db import Database
+    from gshop.shop_service import ShopService
 
     db = Database(os.environ["SHOP_DB_PATH"])
     svc = ShopService(db, None)

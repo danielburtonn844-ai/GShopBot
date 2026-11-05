@@ -121,16 +121,16 @@ def test_supply_flow() -> None:
     print("\n=== 供需全流程 ===")
     tmp = tempfile.mkdtemp()
     os.environ["SHOP_DB_PATH"] = os.path.join(tmp, "sf.db")
-    from examples.models import Database, User, now_iso
-    from examples.supply_service import SupplyService
+    from gshop.models import Database, User, now_iso
+    from gshop.supply_service import SupplyService
 
     db = Database(os.environ["SHOP_DB_PATH"])
     bot = FakeBot()
     shop = type("Shop", (), {"_bot": bot})()
     svc = SupplyService(db, shop)
 
-    from examples.models import Admin
-    db.save_admin(Admin(user_id=100000000, name="主管理员", permissions=["all"],
+    from gshop.models import Admin
+    db.save_admin(Admin(user_id=100000000, name="主管理员",
                         added_by=100000000, added_at=now_iso()))
 
     db.set_setting("supply_price_bot", 10)
@@ -285,11 +285,11 @@ def test_grab_callbacks() -> None:
     print("\n=== 抢单回调 ===")
     tmp = tempfile.mkdtemp()
     os.environ["SHOP_DB_PATH"] = os.path.join(tmp, "gc.db")
-    from examples.models import Grabber, User, now_iso
+    from gshop.models import Grabber, User, now_iso
 
     bot = FakeBot()
     # 重建 runtime 单例，指向临时库
-    import examples.runtime as rt
+    import gshop.runtime as rt
 
     rt.db.__init__(os.environ["SHOP_DB_PATH"])
     rt.service.set_bot(bot)
@@ -297,8 +297,8 @@ def test_grab_callbacks() -> None:
 
     admin = User(user_id=100000000, username="adm", first_name="管", points=0)
     rt.db.save_user(admin)
-    rt.db.save_admin(__import__("examples.models", fromlist=["Admin"]).Admin(
-        user_id=100000000, name="主管理员", permissions=["all"], added_by=100000000,
+    rt.db.save_admin(__import__("gshop.models", fromlist=["Admin"]).Admin(
+        user_id=100000000, name="主管理员", added_by=100000000,
         added_at=now_iso(),
     ))
 
@@ -309,7 +309,7 @@ def test_grab_callbacks() -> None:
     rt.db.set_setting("grab_enabled", True)
     rt.db.set_setting("grab_chat_id", "-1001234")
 
-    from examples.cb_grab import _dispatch_grab
+    from gshop.cb_grab import _dispatch_grab
 
     ctx = type("Ctx", (), {"user_data": {}})()
     tg_user = type("U", (), {"id": 7001, "username": "g1", "first_name": "接单", "last_name": ""})()
@@ -356,8 +356,8 @@ def test_jobs() -> None:
     print("\n=== 后台任务 ===")
     tmp = tempfile.mkdtemp()
     os.environ["SHOP_DB_PATH"] = os.path.join(tmp, "jb.db")
-    import examples.runtime as rt
-    from examples import jobs
+    import gshop.runtime as rt
+    from gshop import jobs
 
     rt.db.__init__(os.environ["SHOP_DB_PATH"])
     bot = FakeBot()
@@ -405,7 +405,7 @@ def test_jobs() -> None:
 # ==================================================================
 def test_chain_errors() -> None:
     print("\n=== 链上拉取异常路径 ===")
-    import examples.chain_watch as cw
+    import gshop.chain_watch as cw
 
     class BoomClient:
         def __init__(self, *a, **kw):
@@ -493,8 +493,8 @@ def test_message_states() -> None:
     print("\n=== 输入状态机 ===")
     tmp = tempfile.mkdtemp()
     os.environ["SHOP_DB_PATH"] = os.path.join(tmp, "hm.db")
-    import examples.runtime as rt
-    from examples.handlers_message import on_message
+    import gshop.runtime as rt
+    from gshop.handlers_message import on_message
 
     rt.db.__init__(os.environ["SHOP_DB_PATH"])
     bot = FakeBot()

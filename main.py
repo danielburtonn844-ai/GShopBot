@@ -1,6 +1,6 @@
-"""G Shop Bot v2.6.0 — 自助报单 + 积分充值 + 抢单派单机器人（模块化版）。
+"""G Shop Bot — 自助报单 + 积分充值 + 抢单派单机器人（模块化版）。
 
-自 v2.4.0 起，单体 main.py 拆分为 examples/ 包内的职责模块：
+自 v2.4.0 起，单体 main.py 拆分为 gshop/ 包内的职责模块：
 
   runtime.py          运行时单例：db / service / supply / stock / grab 的唯一实例
   ui.py               键盘构造、HTML 转义、安全发送、输入状态管理
@@ -41,27 +41,41 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
     MessageHandler,
+    TypeHandler,
     filters,
 )
 
-from examples.handlers_callback import on_callback
-from examples.handlers_command import cmd_admin, cmd_grabber, cmd_start, on_error
-from examples.handlers_message import on_message
-from examples.jobs import (
+from gshop.handlers_callback import on_callback
+from gshop.handlers_command import cmd_admin, cmd_grabber, cmd_start, on_error
+from gshop.handlers_message import on_message
+from gshop.jobs import (
     auto_backup,
     auto_check_chain_recharges,
     auto_check_recharges,
     auto_grab_housekeeping,
+    auto_heartbeat,
     daily_report,
 )
-from examples.runtime import ADMIN_ID, BOT_TOKEN, VERSION, grab, service, stock
-from examples.tasks import drain, spawn
-
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
+from gshop.logging_setup import (
+    new_request_id,
+    request_id_var,
+    setup_logging,
 )
+from gshop.runtime import ADMIN_ID, BOT_TOKEN, VERSION, grab, service, stock
+from gshop.singleton import AlreadyRunning, write_health
+from gshop.singleton import acquire as acquire_lock
+from gshop.tasks import drain, spawn
+
+# P2-13: structured JSON logs (logs/app.log, 10MB x 5 rotation).
+# stderr keeps plain text for foreground tailing.
+# LOG_JSON=0 falls back to plain text; LOG_DIR / LOG_MAX_BYTES / LOG_BACKUP_COUNT override.
+LOG_FILE = setup_logging()
 logger = logging.getLogger(__name__)
+
+# P2-14: flock single instance lock.
+# P2-12: HEALTH_FILE is written at startup and refreshed by the heartbeat task,
+# which is what the Docker HEALTHCHECK probes.
+HEALTH_FILE = os.environ.get("HEALTH_FILE", "/tmp/gshop.health")
 
 
 async def post_init(app: Application) -> None:
@@ -73,6 +87,7 @@ async def post_init(app: Application) -> None:
     spawn(auto_grab_housekeeping(), name="job.grab")        # v2.6.0 抢单超时/预警/佣金解冻
     spawn(daily_report(), name="job.daily_report")
     spawn(auto_backup(), name="job.backup")
+    spawn(auto_heartbeat(HEALTH_FILE), name="job.health")  # P2-12
 
 
 async def post_shutdown(app: Application) -> None:
@@ -126,10 +141,19 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         logger.warning("机器人入群识别处理失败：%s", exc)
 
 
-# Telegram Bot API 的「默认更新集合」明确不含 chat_member（官方文档 getUpdates 一节：
-# 空 allowed_updates 表示除 chat_member / message_reaction / message_reaction_count 外的全部）。
-# 不显式订阅的话，ChatMemberHandler.CHAT_MEMBER 永远收不到事件，退群停权、
-# 专属入群链接校验、入群识别这些风控逻辑全部静默失效。这里显式列出所需类型。
+async def tag_request_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """P2-13: bind an 8-char request id to this update.
+
+    Registered in group=-1 so it runs before every business handler.
+    Log lines then carry [rid=xxxxxxxx] and one update's events can be
+    stitched back together from the log file.
+    """
+    rid = new_request_id()
+    request_id_var.set(rid)
+    tip = context.user_data if context.user_data is not None else {}
+    tip["_rid"] = rid
+
+
 ALLOWED_UPDATES = [
     Update.MESSAGE,         # 命令与私聊消息
     Update.CALLBACK_QUERY,  # 按钮回调
@@ -143,9 +167,26 @@ def main() -> None:
         logger.error("请在 .env 中设置 BOT_TOKEN")
         sys.exit(1)
 
+    # P2-14: refuse to start twice. A second copy would steal getUpdates
+    # from the first and double-credit recharges.
+    try:
+        acquire_lock(os.environ.get("DATA_DIR", "data"))
+    except AlreadyRunning as exc:
+        logger.error("已有实例在运行，本次启动退出：%s", exc)
+        sys.exit(2)
+
+    # P2-12: first health ping so the container is ready before polling starts.
+    write_health(HEALTH_FILE, "ok")
+
     app = (
         Application.builder()
         .token(BOT_TOKEN)
+        # P2-5：并发处理 update。默认 PTB 串行处理，一个慢请求（群发、图册
+        # 上传、链上查询）会把后面所有用户的操作全堵住，表现为「点了没反应」
+        # 甚至回调超时 15 分钟后全部失效。concurrent_updates 是 Builder 的
+        # 方法，不是 run_polling 的参数——写成 run_polling(concurrent_updates=)
+        # 会在启动最后一行抛 TypeError，进程直接退出。
+        .concurrent_updates(True)
         .post_init(post_init)
         .post_shutdown(post_shutdown)
         .build()
@@ -157,6 +198,8 @@ def main() -> None:
 
     private_msg = filters.ChatType.PRIVATE & ~filters.COMMAND
 
+    # P2-13: group=-1 TypeHandler runs first and stamps a request id on this update
+    app.add_handler(TypeHandler(Update, tag_request_id), group=-1)
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("admin", cmd_admin))
     app.add_handler(CommandHandler("grabber", cmd_grabber))  # v2.6.0 接单员中心
@@ -171,11 +214,7 @@ def main() -> None:
     logger.info("🤖 G Shop Bot v%s 已启动（模块化版）", VERSION)
     logger.info("管理员 ID: %s", ADMIN_ID)
 
-    # concurrent_updates=True：默认 PTB 串行处理 update，一个慢请求（群发、
-    # 图册上传、链上查询）会把后面所有用户的操作全堵住，表现为
-    # 「点了没反应」甚至回调超时 15 分钟后全部失效。开启后每个 update
-    # 独立 task 处理，互不阻塞。
-    app.run_polling(allowed_updates=ALLOWED_UPDATES, concurrent_updates=True)
+    app.run_polling(allowed_updates=ALLOWED_UPDATES)
 
 
 if __name__ == "__main__":

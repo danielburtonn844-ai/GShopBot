@@ -47,7 +47,7 @@ def check(name: str, cond: bool, detail: str = "") -> None:
 
 
 def fresh_db(tag: str):
-    from examples.db import Database
+    from gshop.db import Database
 
     tmp = tempfile.mkdtemp(prefix=f"bench_{tag}_")
     path = os.path.join(tmp, "shop.db")
@@ -60,7 +60,7 @@ def fresh_db(tag: str):
 def bench_grab() -> None:
     print("\n=== 1. 抢单原子性：100 线程抢同一单 ===")
     db, path = fresh_db("grab")
-    from examples.models import Grabber, Order, now_iso
+    from gshop.models import Grabber, Order, now_iso
 
     for i in range(1, 101):
         db.save_grabber(Grabber(user_id=8000 + i, seq=i, name=f"接单员{i}", status="active"))
@@ -103,8 +103,8 @@ def bench_grab() -> None:
 def bench_commission() -> None:
     print("\n=== 2. 佣金解冻：自动 vs 手动并发 ===")
     db, path = fresh_db("cm")
-    from examples.grab_service import GrabService
-    from examples.models import Grabber, GrabCommission, now_iso
+    from gshop.grab_service import GrabService
+    from gshop.models import Grabber, GrabCommission, now_iso
 
     db.save_grabber(Grabber(user_id=5001, seq=1, name="测试员", status="active",
                             balance_frozen=1000, balance_available=0))
@@ -153,8 +153,8 @@ def bench_commission() -> None:
 def bench_suffix() -> None:
     print("\n=== 3. TRON 尾数并发分配（同金额 10 USDT）===")
     db, path = fresh_db("sfx")
-    from examples.models import User
-    from examples.shop_service import ShopService
+    from gshop.models import User
+    from gshop.shop_service import ShopService
 
     db.set_setting("pay_tron_enabled", True)
     db.set_setting("tron_wallet_address", "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t")
@@ -199,8 +199,8 @@ def bench_suffix() -> None:
 def bench_withdrawal() -> None:
     print("\n=== 4. 提现审核：通过 vs 拒绝并发 ===")
     db, path = fresh_db("wd")
-    from examples.grab_service import GrabService
-    from examples.models import Grabber, Withdrawal, now_iso
+    from gshop.grab_service import GrabService
+    from gshop.models import Grabber, Withdrawal, now_iso
 
     db.save_grabber(Grabber(user_id=4001, seq=1, name="提现员", status="active",
                             balance_available=1000, balance_frozen=0))
@@ -248,7 +248,7 @@ def bench_withdrawal() -> None:
 def bench_throughput() -> None:
     print("\n=== 5. 并发读写吞吐 ===")
     db, path = fresh_db("tput")
-    from examples.models import User
+    from gshop.models import User
 
     N = 1000
     for i in range(N):

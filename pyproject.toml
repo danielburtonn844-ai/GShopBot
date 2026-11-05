@@ -1,6 +1,11 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+
 [project]
 name = "gshopbot"
-version = "2.7.1"
+dynamic = ["version"]
 description = "Telegram 自助报单 + 积分商城 + 抢单派单机器人"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -34,3 +39,75 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 "test_bot_full.py" = ["E402", "F841", "B"]
 "verify_issues.py" = ["E402"]
+
+[tool.setuptools.dynamic]
+version = {file = ["VERSION"]}
+
+[tool.coverage.run]
+source = ["gshop", "main"]
+branch = true
+omit = ["*/tests/*", "test_*.py", "verify_issues.py", "bench_*.py"]
+
+[tool.coverage.report]
+precision = 1
+skip_covered = false
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.:",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+]
+
+# ---------------------------------------------------------------------------
+# mypy（审计 P2-16 静态检查）
+#
+# 分级策略：普通模式必须 0 错误（CI 硬门限），--strict 另跑一次只卡
+# no-any-return / attr-defined / unused-ignore / no-redef 这几类真缺陷。
+# no-untyped-def / no-untyped-call / type-arg 属于「给整个项目补类型注解」
+# 的工程量级，不纳入本版本门限，strict 里显式关掉（详见 CHANGELOG v2.8.0）。
+# ---------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+warn_unreachable = true
+show_error_codes = true
+exclude = ['venv', '\.venv', '__pycache__', 'build', 'dist']
+
+[[tool.mypy.overrides]]
+# 测试与校验脚本不参与类型门限：它们是运行期断言脚本，大量动态 getattr。
+module = [
+    "test_bot_full",
+    "test_extra",
+    "test_p2_fixes",
+    "test_p2_9_money",
+    "test_version_consistency",
+    "test_coverage_boost",
+    "test_cov_deep",
+    "test_cov_deep2",
+    "test_cov_deep3",
+    "test_suites",
+    "verify_issues",
+    "conftest",
+    "bench_concurrency",
+    "sitecustomize",
+    "_covshim",
+]
+ignore_errors = true
+
+# ---------------------------------------------------------------------------
+# pytest（审计 P2-16：测试框架迁到 pytest）
+#
+# 关键点：python_files 只认 test_suites.py。仓库里的 test_*.py 是自执行断言
+# 脚本（顶层 print + sys.exit），pytest 直接 import 会在收集期撞 SystemExit
+# 报 INTERNALERROR。统一入口 test_suites.py 用子进程跑它们，退出码判成败。
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+minversion = "7.0"
+python_files = ["test_suites.py"]
+testpaths = ["."]
+norecursedirs = [".git", ".mypy_cache", ".pytest_cache", ".ruff_cache", "__pycache__", "venv", ".venv", "build", "dist", "logs", "data", "backups"]
+addopts = "-q"
+
+

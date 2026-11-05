@@ -4,7 +4,7 @@
 
 **Telegram 自助报单 + 积分商城 + 抢单派单机器人**
 
-版本 `v2.7.1` · Python 3.10+ · SQLite · python-telegram-bot 22.8
+版本 `v2.8.0` · Python 3.10+ · SQLite · python-telegram-bot 22.8
 
 [![CI](https://github.com/danielburtonn844-ai/GShopBot/actions/workflows/ci.yml/badge.svg)](https://github.com/danielburtonn844-ai/GShopBot/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
@@ -90,7 +90,7 @@ SQLite 3
 git clone <your-repo-url>
 cd report-bot
 python3 -m venv venv
-venv/bin/pip install -r requirements.txt
+venv/bin/pip install --require-hashes -r requirements.lock   # 或 requirements.txt（未锁定）
 ```
 
 ### 3. 配置
@@ -113,30 +113,57 @@ vim .env
 ### 4. 跑测试
 
 ```bash
-python3 test_bot_full.py           # 业务全链路自检，7207 项
-python3 verify_issues.py           # 缺陷回归，47 项
+python3 -m pytest                  # 统一入口，10 套件全跑（推荐）
+
+# 或逐个跑
+python3 test_bot_full.py           # 业务全链路自检，7236 项
+python3 verify_issues.py           # 缺陷回归，51 项
 python3 test_extra.py              # 分支补强，85 项
 python3 test_coverage_boost.py     # 深度覆盖，75 项
+python3 test_p2_fixes.py           # v2.7.1 P2 批次回归，61 项
+python3 test_p2_9_money.py         # Decimal 金额精度，13 项
+python3 test_version_consistency.py  # 版本号单一源，15 项
+python3 test_cov_deep.py           # 深度覆盖套件 1，199 项
+python3 test_cov_deep2.py          # 深度覆盖套件 2，173 项
+python3 test_cov_deep3.py          # 深度覆盖套件 3，165 项
 python3 bench_concurrency.py       # 并发压测，10 项（多线程真实竞争）
 ```
 
+`pytest` 入口是 `test_suites.py`：仓库里的 `test_*.py` 都是「顶层 print + `sys.exit`」的
+自执行脚本，直接被 pytest import 会在收集期撞 `SystemExit` 报 `INTERNALERROR`，
+所以统一入口用子进程跑它们、退出码判成败。
+
 全部离线运行（链上 API 走 mock，支付接口走 stub），强制走 `SHOP_DB_PATH` 隔离，不会碰正式库，也不需要联网。
 
-覆盖率（当前 76%）：
+覆盖率（当前 **85.3%**，8075 语句 / 2540 分支，CI 门限 85%）：
 
 ```bash
 pip install coverage
-coverage run --source=examples,main test_bot_full.py
-coverage run -a --source=examples,main test_extra.py
-coverage run -a --source=examples,main test_coverage_boost.py
-coverage report --skip-covered
+coverage erase
+for f in test_bot_full.py test_extra.py test_coverage_boost.py verify_issues.py \
+         test_p2_fixes.py test_p2_9_money.py \
+         test_cov_deep.py test_cov_deep2.py test_cov_deep3.py; do
+  coverage run -a --source=gshop,main "$f"
+done
+coverage report --fail-under=85 --skip-covered
 ```
 
-代码风格检查：
+静态检查：
 
 ```bash
-pip install ruff
-ruff check main.py examples verify_issues.py test_extra.py test_coverage_boost.py bench_concurrency.py
+pip install ruff mypy
+ruff check main.py gshop verify_issues.py      # 零告警
+mypy gshop main.py                             # 普通模式零错误
+mypy gshop main.py --strict \
+  --disable-error-code=no-untyped-def \
+  --disable-error-code=no-untyped-call \
+  --disable-error-code=type-arg                 # 只卡真缺陷类别
+```
+
+依赖安装走哈希锁文件（供应链防护）：
+
+```bash
+pip install --require-hashes -r requirements.lock
 ```
 
 ### 5. 启动
@@ -193,7 +220,7 @@ systemctl enable --now gshopbot
 
 ```
 main.py                     唯一入口（装配 + 接单群成员监听），不要运行其他任何 .py
-examples/
+gshop/
 ├── db/                     数据层（v2.6.4 从 2639 行 God Class 拆出）
 │   ├── base.py             常量与工具函数（时区 / 单号 / 格式化 / 状态字典）
 │   ├── schema.py           全部 dataclass（纯数据，无业务逻辑）
@@ -211,6 +238,11 @@ examples/
 │       ├── supply.py       付费供需
 │       ├── stock.py        库存池与到货提醒
 │       └── grab.py         抢单派单（接单员/佣金/提现/申诉）
+├── constants.py            状态常量（OrderStatus / GrabStatus / WithdrawalStatus / SupplyStatus）
+├── money.py                Decimal 金额工具（to_dec / q2 / usdt_from_points / fmt_usdt）
+├── logging_setup.py        结构化 JSON 日志 + request_id 上下文 + log_event
+├── singleton.py            flock 单实例锁 + 心跳文件
+├── version.py              版本号读取（唯一来源：仓库根 VERSION）
 ├── models.py               兼容层：转导出 db 包，所有 `from .models import ...` 照旧
 ├── handlers_callback.py    回调总入口（78 行：建档 → 清状态 → 权限闸门 → 分发）
 ├── cb_user.py              用户端：主菜单 / 商品 / 购买 / 订单 / 充值
@@ -237,13 +269,22 @@ examples/
 data/
 └── shop.db                 数据库（自动生成，已 gitignore）
 
-test_bot_full.py            自检脚本（7207 断言，全离线）
-verify_issues.py            缺陷回归（47 断言：佣金竞态 / 链上分页 / 更新订阅 / 金额精度 / 尾数唯一性 / TON 协议 / 补账 / 退款快照 / 普通充值精度）
+test_suites.py              pytest 统一入口（10 套件子进程执行，退出码判成败）
+test_bot_full.py            自检脚本（7236 断言，全离线）
+verify_issues.py            缺陷回归（51 断言：佣金竞态 / 链上分页 / 更新订阅 / 金额精度 / 尾数唯一性 / TON 协议 / 补账 / 退款快照 / concurrent_updates 位置）
 test_extra.py               分支补强（85 断言：UI 降级 / 欢迎图媒体切换 / 供需定价 / 地址校验 / 门面完整性）
 test_coverage_boost.py      深度覆盖（75 断言：供需全流程 / 抢单回调 / 后台任务 / 链上异常 / 状态机）
+test_p2_fixes.py            v2.7.1 P2 批次回归（61 断言）
+test_p2_9_money.py          Decimal 金额精度（13 断言）
+test_version_consistency.py 版本号单一源（15 断言）
+test_cov_deep.py            深度覆盖套件 1（199 断言：金额 / 日志 / 富文本 / 支付 / 命令）
+test_cov_deep2.py           深度覆盖套件 2（173 断言：供需 / 库存 / 回调 / 页面）
+test_cov_deep3.py           深度覆盖套件 3（165 断言：单例 / 任务 / 主模块 / 后台 job）
 bench_concurrency.py        并发压测（10 项：多线程抢单 / 并发解冻 / 尾数唯一 / 提现并发 / 吞吐）
-.github/workflows/ci.yml    CI：ruff + 语法 + 四套测试 + 覆盖率门槛 75%（Python 3.10/3.11/3.12）
-pyproject.toml              项目元数据 + ruff 规则
+requirements.lock           运行期依赖哈希锁（9 wheel 全 sha256）
+Dockerfile                  多阶段构建 + 非 root + HEALTHCHECK
+.github/workflows/ci.yml    CI：ruff + mypy + 语法 + 十套测试 + 覆盖率门槛 85%（Python 3.10/3.11/3.12）
+pyproject.toml              项目元数据 + ruff + mypy + pytest + coverage 配置
 ```
 
 ---
@@ -262,6 +303,14 @@ pyproject.toml              项目元数据 + ruff 规则
 | 连接复用 | 每线程一条持久 SQLite 连接，WAL 只设一次；1000 次读写 14 → 249 次/秒 |
 | 媒体感知更新 | `send_or_edit` 按消息当前媒体选择编辑方式，主界面欢迎图切换不丢 |
 | 防偷老板 | 匿名派单卡片不含买家信息，群内只显示接单员编号 |
+| 单实例保护 | `flock` 锁 `data/.lock`，双开不会互抢 update（Telegram 报 409） |
+| 迁移安全网 | 启动读 `PRAGMA user_version`，库版本高于程序则拒绝启动并提示 |
+| 依赖锁定 | `requirements.lock` 9 个 wheel 全 sha256，CI 走 `--require-hashes` |
+| 静态检查 | `mypy` 普通模式 0 错误；`--strict` 只卡真缺陷类别，同样 0 条 |
+| 单实例保护 | `flock` 锁 `data/.lock`，双开不会互抢 update（Telegram 报 409） |
+| 迁移安全网 | 启动读 `PRAGMA user_version`，库版本高于程序则拒绝启动并提示 |
+| 依赖锁定 | `requirements.lock` 9 个 wheel 全 sha256，CI 走 `--require-hashes` |
+| 静态检查 | `mypy` 普通模式 0 错误；`--strict` 只卡真缺陷类别，同样 0 条 |
 
 历史缺陷与对应的修复方式见 [CHANGELOG](CHANGELOG.md)。
 

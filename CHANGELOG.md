@@ -1,5 +1,98 @@
 # CHANGELOG — G Shop Bot
 
+## v2.8.0 · 2026-11-05
+
+> 承接 v2.7.1，按《GShopBot-完整审计与改造需求》与《二次深挖增量审计》把 P2 批次收完。
+> 本版主线是「把隐式契约变成显式契约」：金额全链路 Decimal、状态字符串常量化、日志结构化、
+> 测试与静态检查进 CI。额外挖出并修复了 **5 个审计范围外的真实缺陷**（见末尾）。
+
+### 严重缺陷（审计范围外，本版修复）
+
+- **机器人启动即崩**。`main.py` 原写 `app.run_polling(allowed_updates=..., concurrent_updates=True)`，
+  但 `concurrent_updates` 是 `ApplicationBuilder` 的链式方法，**不是 `run_polling` 的参数**（`run_polling`
+  签名只有 `poll_interval` / `timeout` / `bootstrap_retries` / `allowed_updates` /
+  `drop_pending_updates` / `close_loop` / `stop_signals`）。写成这样会在启动最后一行抛
+  `TypeError: got an unexpected keyword argument 'concurrent_updates'`，进程直接退出。已移到 builder 链上
+  `.concurrent_updates(True)`。
+  注：原 `verify_issues.py` 里那条 `"concurrent_updates=True" in src` 的字符串断言一直是绿的，
+  等于测试把 bug 钉死在了错误位置。现已改为 **AST 真解析**。
+- **HEALTHCHECK 永远失败**。`jobs.py` 缺 `now_iso` 导入，健康检查写心跳时 `NameError`，
+  Docker 容器被判定 unhealthy 后被重启循环。
+- **订单详情页缺「查看该件」按钮**。`pages_admin.py` 把 `buttons_item` 组装好了却
+  从未拼进 `buttons`，库存池发出的那件货在后台订单详情里点不进去。
+- **`after_grabber_complete` 空指针**。订单已被删除时仍取 `order.xxx`，抛 `AttributeError`。
+- **`idx_recharge_status_chain` 建索引早于补列**。老库升级时 `chain_txid` 列尚未存在，
+  `CREATE INDEX` 直接报错且被吞掉，索引永远没建成。
+
+### 金额与数值（审计 P2-9）
+
+- 金额全链路改 `Decimal`：`gshop/money.py` 提供 `to_dec` / `q2` / `usdt_from_points` /
+  `points_from_usdt` / `dec_str` / `fmt_usdt` / `parse_user_amount`，四舍五入固定 `ROUND_HALF_UP`
+  （原 `round()` 是银行家舍入，0.145 会变 0.14）。转账、提现、兑换、商品定价、
+  抢单佣金全走 Decimal；SQLite 边界用 `sqlite3.register_adapter` 单点转换。
+- `safe_float()` 拒绝 `inf` / `nan`，避免 `timedelta(hours=inf)` 抛 `OverflowError`。
+- 订单金额比较全部改 `Decimal` 比较，消除 `0.1 + 0.2 != 0.3` 类误判。
+
+### 状态与流程（审计 P2-7 / P2-8）
+
+- 新增 `gshop/constants.py`：`OrderStatus` / `GrabStatus` / `WithdrawalStatus` / `SupplyStatus`
+  常量类，消掉全仓 300+ 处裸字符串 `"pending"` / `"paid"` 拼写风险。
+- 订单取消真实可用：`cancel_order` 走 `cancelled` 状态，与退款语义分开，
+  并回滚已扣积分 / 库存占用。
+- 删除 `permissions` 假功能：原实现只存不读，后台能勾选但永远不生效，容易让管理员误以为已限权。
+
+### 可靠性与性能（审计 P2-10 / P2-11 / P2-17）
+
+- **热索引命中**：`get_setting` 单键读取走内存缓存，不再每次打开连接查 `settings` 表。
+- **`schema_version` 迁移安全网**：启动时先读 `PRAGMA user_version`，比当前版本高则
+  拒绝启动并给出明确提示，避免新版写入的表结构被旧版当作正常数据读。
+- **报单不占库存**：自助报单在审核前不再预扣库存，避免噪子报单把库存锁死。
+
+### 可观测性（审计 P2-13）
+
+- 日志改结构化 JSON（`logs/app.log`，10MB × 5 轮转），`logging_setup.py` 提供
+  `request_id` 上下文变量与 `log_event()`，每条日志带 `trace_id` / `user_id` / `order_id`。
+- 异常日志带 `exc_info` 与堆栈摘要，不再只打一句 `str(e)`。
+
+### 代码结构（审计 P2-2 / P2-3）
+
+- `examples/` 目录改名 `gshop/`，包名与目录一致，`from gshop import ...` 不再靠
+  `sys.path` 把戏。
+- God 函数拆分：`handlers_message.py` 的报单流程抽成 `_handle_*` 分组 + `_STATE_HANDLERS`
+  分发；`cb_admin.py` 的后台设置同样按业务分组抽 `_handle_*`。零行为变更。
+
+### 安全与运维（审计 P2-4 / P2-12 / P2-14）
+
+- **HTML 转义双向修正**：`escape_html` 与 `strip_html_tags` 不再互相破坏，
+  用户名里的 `<` `>` `&` 不会再把整条消息弄成非法 HTML。
+- **Dockerfile + 健康检查**：多阶段构建，非 root 运行，`HEALTHCHECK` 读心跳文件。
+- **flock 单实例锁**：`gshop/singleton.py` 用 `flock` 锁住 `data/.lock`，
+  两个进程同时起来不会互相抢 update（Telegram 会报 409 Conflict）。
+
+### 测试与静态检查（审计 P2-16）
+
+- **测试框架迁 pytest**：新增 `test_suites.py` 统一入口，`pyproject.toml` 的
+  `[tool.pytest.ini_options]` 把 `python_files` 限定为 `test_suites.py`。原因：仓库里的
+  `test_*.py` 都是「顶层 print + sys.exit」的自执行脚本，直接被 pytest import 会在
+  收集期撞 `SystemExit` 报 `INTERNALERROR`；现由 `test_suites.py` 用子进程跑，退出码判成败。
+- **覆盖率 ≥ 85%**：十套件同会话累积采集，实测 **8075 语句 / 2540 分支 / 85.2%**，
+  CI 门限从 `--fail-under=75` 上调到 `--fail-under=85`。
+  新增 `test_cov_deep.py`（1100 行）/ `test_cov_deep2.py`（589 行）/ `test_cov_deep3.py`（888 行），
+  共 537 项断言，全绿。
+- **mypy 纳入 CI**：普通模式 **249 → 0 条**（硬门限）；`--strict` 另跑一次，
+  只卡 `no-any-return` / `attr-defined` / `unused-ignore` / `no-redef` 这几类真缺陷，已清到 **0 条**。
+  `no-untyped-def`（61）/ `type-arg`（26）/ `no-untyped-call`（17）属于「给整个项目补类型注解」
+  的工程量级，不纳入本版本门限（见 `pyproject.toml` 的 `[tool.mypy]` 段注释）。
+- **依赖哈希锁定**：新增 `requirements.lock`（9 个 wheel 全 sha256），CI 改用
+  `pip install --require-hashes -r requirements.lock`。`requirements.txt` 只写顶层直接依赖，
+  传递依赖每次都解析到最新版，上游一次破坏性发版即可远程改变运行行为。
+- **ruff 全绿**：`ruff check main.py gshop verify_issues.py` 零告警。
+
+### 文档
+
+- README 目录树、快速开始、测试命令全部同步到 v2.8.0；补上 Docker / mypy /
+  覆盖率门限的说明。
+
 ## v2.7.1 · 2026-11-05
 
 > 承接 v2.7.0，收掉二次深挖审计里的 P2 批次：回调解析健壮性、后台任务生命周期、

@@ -39,7 +39,7 @@ def test_ui() -> None:
     print("\n=== UI 工具 ===")
     from telegram import InlineKeyboardMarkup
 
-    from examples.ui import (
+    from gshop.ui import (
         audit,
         clear_state,
         get_points,
@@ -179,7 +179,7 @@ def test_ui() -> None:
     # audit / get_points 走真实库
     tmp = tempfile.mkdtemp()
     os.environ["SHOP_DB_PATH"] = os.path.join(tmp, "ui.db")
-    import examples.runtime as rt
+    import gshop.runtime as rt
 
     rt.db.__init__(os.environ["SHOP_DB_PATH"])  # 重建到临时库
     audit(100000000, "测试动作", "细节")
@@ -195,8 +195,8 @@ def test_supply_pricing() -> None:
     print("\n=== 供需定价与开关 ===")
     tmp = tempfile.mkdtemp()
     os.environ["SHOP_DB_PATH"] = os.path.join(tmp, "sp.db")
-    from examples.models import Database
-    from examples.supply_service import SupplyService
+    from gshop.models import Database
+    from gshop.supply_service import SupplyService
 
     db = Database(os.environ["SHOP_DB_PATH"])
     svc = SupplyService(db, None)
@@ -249,7 +249,7 @@ def test_chain_utils() -> None:
     print("\n=== 链上工具函数 ===")
     from decimal import Decimal
 
-    from examples.chain_watch import (
+    from gshop.chain_watch import (
         is_valid_ton,
         is_valid_tron,
         parse_chain_amount,
@@ -294,10 +294,10 @@ def test_chain_utils() -> None:
 # ==================================================================
 def test_db_facade() -> None:
     print("\n=== Database 门面 ===")
-    from examples.db import Database
-    from examples.db.mixins.admin import AdminMixin
-    from examples.db.mixins.grab import GrabMixin
-    from examples.db.mixins.user import UserMixin
+    from gshop.db import Database
+    from gshop.db.mixins.admin import AdminMixin
+    from gshop.db.mixins.grab import GrabMixin
+    from gshop.db.mixins.user import UserMixin
 
     check("Database 继承 UserMixin", issubclass(Database, UserMixin))
     check("Database 继承 AdminMixin", issubclass(Database, AdminMixin))
@@ -307,7 +307,7 @@ def test_db_facade() -> None:
           str([n for n in Database.__dict__ if not n.startswith("_")]))
 
     # 兼容层：老路径照样能拿到全部名字
-    import examples.models as legacy
+    import gshop.models as legacy
 
     for name in ("Database", "User", "Order", "Grabber", "now_iso", "ORDER_STATUS", "SUPPLY_CHANNELS"):
         check(f"models.{name} 仍可导入", hasattr(legacy, name))
@@ -324,7 +324,7 @@ def test_welcome_photo() -> None:
     print("\n=== 欢迎图：回主界面不丢图 ===")
     from telegram import InlineKeyboardMarkup
 
-    from examples.ui import send_or_edit
+    from gshop.ui import send_or_edit
 
     KBD = InlineKeyboardMarkup([[]])
 
@@ -421,10 +421,10 @@ def test_welcome_photo() -> None:
     # 7) home_photo() 读的是 settings 里的 welcome_image
     tmp = tempfile.mkdtemp()
     os.environ["SHOP_DB_PATH"] = os.path.join(tmp, "wp.db")
-    import examples.runtime as rt
+    import gshop.runtime as rt
 
     rt.db.__init__(os.environ["SHOP_DB_PATH"])
-    from examples.pages_user import home_photo
+    from gshop.pages_user import home_photo
 
     check("未设置欢迎图时返回空串", home_photo() == "")
     rt.db.update_settings(welcome_image=WELCOME)

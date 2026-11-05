@@ -39,7 +39,7 @@ def run(coro):
 # --------------------------------------------------------------- N-P2-2
 def test_safe_int():
     print("\n=== N-P2-2  cb_grab 回调参数安全解析 ===")
-    from examples.cb_grab import _safe_int
+    from gshop.cb_grab import _safe_int
 
     check("正常数字", _safe_int("123") == 123)
     check("带空格", _safe_int(" 42 ") == 42)
@@ -54,7 +54,7 @@ def test_safe_int():
 # --------------------------------------------------------------- N-P2-5/6/7
 def test_task_registry():
     print("\n=== N-P2-5/6/7  后台任务注册表 ===")
-    import examples.tasks as T
+    import gshop.tasks as T
 
     async def body():
         async def work(x):
@@ -85,8 +85,8 @@ def test_task_registry():
 # --------------------------------------------------------------- N-P2-8
 def test_iter_users_cursor():
     print("\n=== N-P2-8  iter_users 游标分页 ===")
-    from examples.models import User, now_iso
-    from examples.runtime import db
+    from gshop.models import User, now_iso
+    from gshop.runtime import db
 
     base = now_iso()
     for i in range(1, 31):
@@ -120,9 +120,9 @@ def test_iter_users_cursor():
 # --------------------------------------------------------------- N-P2-9
 def test_backup():
     print("\n=== N-P2-9  do_backup 一致性快照 + integrity_check ===")
-    import examples.jobs as J
-    from examples.models import User
-    from examples.runtime import db
+    import gshop.jobs as J
+    from gshop.models import User
+    from gshop.runtime import db
 
     bk = os.path.join(_TMP, "backups")
     J.BACKUP_DIR = bk
@@ -144,7 +144,7 @@ def test_backup():
         c.close()
     check("备份内容可读", rows > 0, str(rows))
     check("integrity_check = ok", ok == "ok", ok)
-    jsrc = open("examples/jobs.py", encoding="utf-8").read()
+    jsrc = open("gshop/jobs.py", encoding="utf-8").read()
     check("不再 import shutil", "import shutil" not in jsrc)
     check("改用 SQLite backup API", ".backup(" in jsrc)
 
@@ -152,7 +152,7 @@ def test_backup():
 # --------------------------------------------------------------- N-P2-10
 def test_admin_id_parse():
     print("\n=== N-P2-10  ADMIN_ID 解析 ===")
-    from examples.runtime import _parse_admin_id
+    from gshop.runtime import _parse_admin_id
 
     check("正常 ID", _parse_admin_id("100000000") == 100000000)
     check("空串→0", _parse_admin_id("") == 0)
@@ -162,14 +162,14 @@ def test_admin_id_parse():
     check("零→0", _parse_admin_id("0") == 0)
     check("带空格可解析", _parse_admin_id(" 123 ") == 123)
 
-    src = open("examples/runtime.py", encoding="utf-8").read()
+    src = open("gshop/runtime.py", encoding="utf-8").read()
     check("0 号管理员不再无条件建档", "if ADMIN_ID > 0:" in src)
 
 
 # --------------------------------------------------------------- N-P2-12
 def test_safe_float():
     print("\n=== N-P2-12  safe_float 拒绝 inf/nan ===")
-    from examples.models import safe_float
+    from gshop.models import safe_float
 
     check("inf → 默认值", safe_float("inf", 24, 0, 8760) == 24)
     check("-inf → 默认值", safe_float("-inf", 24, 0, 8760) == 24)
@@ -184,7 +184,7 @@ def test_safe_float():
     # 关键：timedelta 不再被 inf 炸
     from datetime import datetime, timedelta
 
-    from examples.models import LOCAL_TZ
+    from gshop.models import LOCAL_TZ
 
     try:
         datetime.now(LOCAL_TZ) + timedelta(hours=safe_float("inf", 24, 0, 8760))
@@ -196,7 +196,7 @@ def test_safe_float():
 # --------------------------------------------------------------- N-P2-13
 def test_recharge_id_prefix():
     print("\n=== N-P2-13  充值单号分域前缀 ===")
-    from examples.models import gen_recharge_id
+    from gshop.models import gen_recharge_id
 
     ids = {
         "default": gen_recharge_id(),
@@ -218,7 +218,7 @@ def test_recharge_id_prefix():
 # --------------------------------------------------------------- N-P2-4
 def test_aclose():
     print("\n=== N-P2-4  ShopService.aclose 释放连接池 ===")
-    from examples.runtime import service
+    from gshop.runtime import service
 
     async def body():
         # 未创建过客户端时 aclose 不报错
@@ -258,11 +258,11 @@ def test_aclose():
 # --------------------------------------------------------------- N-P2-1/3
 def test_appeal_and_answer():
     print("\n=== N-P2-1/N-P2-3  申诉归属校验 / 回调应答兜底 ===")
-    src = open("examples/grab_service.py", encoding="utf-8").read()
+    src = open("gshop/grab_service.py", encoding="utf-8").read()
     check("申诉含订单归属校验", "该订单不属于你" in src)
     check("申诉含重复提交拦截", "已有待裁定申诉" in src)
 
-    hc = open("examples/handlers_callback.py", encoding="utf-8").read()
+    hc = open("gshop/handlers_callback.py", encoding="utf-8").read()
     check("query.answer 有 try 兜底", "回调应答失败" in hc)
 
 
