@@ -33,6 +33,7 @@ from .models import (
     fmt_time,
     gen_withdraw_id,
     now_iso,
+    safe_float,
 )
 from .richtext import (
     ICON_A_MAIL,
@@ -383,7 +384,9 @@ class GrabService:
         """
         s = self.settings
         cooldown_sec = int(s.get("grab_cooldown_seconds", 5) or 0)
-        timeout_h = float(s.get("grab_timeout_hours", 24) or 24)
+        # safe_float 拒绝 inf/nan（N-P2-12）：历史脏数据里的 inf 会让
+        # 下面的 timedelta(hours=...) 直接 OverflowError。
+        timeout_h = safe_float(s.get("grab_timeout_hours", 24), 24, 0, 8760)
 
         with self.db.atomic() as conn:
             g = self.db.get_grabber(user_id, conn=conn)
@@ -569,7 +572,7 @@ class GrabService:
 
         # 接单员到账说明
         if order.commission > 0 and self._bot:
-            freeze_h = float(self.settings.get("grab_freeze_hours", 24) or 0)
+            freeze_h = safe_float(self.settings.get("grab_freeze_hours", 24), 24, 0, 8760)
             if freeze_h > 0:
                 tip = f"佣金 <code>{order.commission}</code> 积分已冻结，{freeze_h:g} 小时后自动解冻"
             else:
@@ -893,6 +896,11 @@ class GrabService:
     # ==================================================================
 
     def create_appeal(self, grabber_id: int, order_id: str, content: str) -> tuple[GrabAppeal | None, str | None]:
+        """提交申诉（v2.7.0 审计 N-P2-1）：补归属校验与重复提交拦截。
+
+        旧实现只校验「档案存在 + 内容非空」，任意接单员传入别人的 order_id 就能
+        给别人的单刷申诉，同一个人还能对同一单反复提交，管理端裁定队列会被灌爆。
+        """
         content = content.strip()
         if not content:
             return None, "申诉内容不能为空"
@@ -901,6 +909,16 @@ class GrabService:
         g = self.db.get_grabber(grabber_id)
         if not g:
             return None, "接单员档案不存在"
+        if order_id:
+            order = self.db.get_order(order_id)
+            if not order:
+                return None, "关联订单不存在"
+            # 只能对自己的单申诉：抢单人必须是本人，或该单从未被抢（申诉派单不公）
+            if order.grabber_id and order.grabber_id != grabber_id:
+                return None, "该订单不属于你，无法申诉"
+            existing = self.db.list_grab_appeals(grabber_id=grabber_id, status="pending")
+            if any(a.order_id == order_id for a in existing):
+                return None, "该订单已有待裁定申诉，请等待处理"
         aid = self.db.create_grab_appeal(
             GrabAppeal(grabber_id=grabber_id, order_id=order_id, content=content, status="pending")
         )

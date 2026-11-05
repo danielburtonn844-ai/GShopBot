@@ -35,6 +35,19 @@ from .ui import audit, h, kb, send_or_edit
 logger = logging.getLogger(__name__)
 
 
+def _safe_int(raw, default: int = 0) -> int:
+    """把回调数据里的数字片段安全转成 int（解析失败返回 default）。
+
+    旧实现直接 `int(data[7:])`，遇到历史消息里残留的旧格式按钮、
+    或被构造的 callback_data 会抛 ValueError，整个 handler 中断，
+    用户看到的是「点了没反应」。这里统一兜底。
+    """
+    try:
+        return int(str(raw).strip())
+    except (TypeError, ValueError):
+        return default
+
+
 
 
 async def _dispatch_grab(
@@ -81,19 +94,19 @@ async def _dispatch_grab(
         return True
 
     if data == "gb:doing" or data.startswith("gb:doing:"):
-        page = int(data.split(":")[2]) if data.count(":") == 2 and data.split(":")[2].isdigit() else 0
+        page = _safe_int(data.split(":")[2]) if data.count(":") == 2 else 0
         text, keyboard = page_grab_doing(uid, page)
         await send_or_edit(query, text, keyboard)
         return True
 
     if data == "gb:done" or data.startswith("gb:done:"):
-        page = int(data.split(":")[2]) if data.count(":") == 2 and data.split(":")[2].isdigit() else 0
+        page = _safe_int(data.split(":")[2]) if data.count(":") == 2 else 0
         text, keyboard = page_grab_done(uid, page)
         await send_or_edit(query, text, keyboard)
         return True
 
     if data == "gb:money" or data.startswith("gb:money:"):
-        page = int(data.split(":")[2]) if data.count(":") == 2 and data.split(":")[2].isdigit() else 0
+        page = _safe_int(data.split(":")[2]) if data.count(":") == 2 else 0
         text, keyboard = page_grab_money(uid, page)
         await send_or_edit(query, text, keyboard)
         return True
@@ -212,7 +225,11 @@ async def _dispatch_grab(
         return True
 
     if data.startswith("a:gber:"):
-        text, keyboard = page_admin_grabber_detail(int(data[7:]))
+        gid = _safe_int(data[7:])
+        if gid <= 0:
+            await _toast("参数错误", show_alert=True)
+            return True
+        text, keyboard = page_admin_grabber_detail(gid)
         await send_or_edit(query, text, keyboard)
         return True
 
@@ -230,7 +247,11 @@ async def _dispatch_grab(
 
     # 重发/生成接单员专属入群链接（链接泄漏或进群失败时用）
     if data.startswith("a:gblink:"):
-        g = db.get_grabber(int(data[9:]))
+        gid = _safe_int(data[9:])
+        if gid <= 0:
+            await _toast("参数错误", show_alert=True)
+            return True
+        g = db.get_grabber(gid)
         if not g:
             await _toast("接单员不存在")
             return True
@@ -268,27 +289,35 @@ async def _dispatch_grab(
 
     if data.startswith("a:gbst:"):
         parts = data.split(":")
-        g = grab.set_grabber_status(int(parts[2]), parts[3], operator_id=uid)
+        gid = _safe_int(parts[2] if len(parts) > 2 else "")
+        new_status = parts[3] if len(parts) > 3 else ""
+        if gid <= 0 or not new_status:
+            await _toast("参数错误", show_alert=True)
+            return True
+        g = grab.set_grabber_status(gid, new_status, operator_id=uid)
         if g:
-            audit(uid, "接单员状态变更", f"{g.display()} → {parts[3]}")
+            audit(uid, "接单员状态变更", f"{g.display()} → {new_status}")
             # 状态变更私信告知本人
             notice = {
                 "active": "🟢 你已恢复在岗，可以抢单了",
                 "rest": "🟡 你已被设为请假，恢复在岗后才能抢单",
                 "suspended": "🔴 你已被停权，请联系管理员",
                 "blacklist": "⛔ 你已被拉入黑名单",
-            }.get(parts[3])
+            }.get(new_status)
             if notice:
                 try:
                     await context.bot.send_message(g.user_id, notice)
                 except Exception:
                     pass
-        text, keyboard = page_admin_grabber_detail(int(parts[2]))
+        text, keyboard = page_admin_grabber_detail(gid)
         await send_or_edit(query, text, keyboard)
         return True
 
     if data.startswith("a:gbdelok:"):
-        uid2 = int(data[10:])
+        uid2 = _safe_int(data[10:])
+        if uid2 <= 0:
+            await _toast("参数错误", show_alert=True)
+            return True
         g = db.get_grabber(uid2)
         if db.delete_grabber(uid2):
             audit(uid, "删除接单员档案", g.display() if g else str(uid2))
@@ -298,7 +327,10 @@ async def _dispatch_grab(
         return True
 
     if data.startswith("a:gbdel:"):
-        uid2 = int(data[8:])
+        uid2 = _safe_int(data[8:])
+        if uid2 <= 0:
+            await _toast("参数错误", show_alert=True)
+            return True
         g = db.get_grabber(uid2)
         name = g.display() if g else str(uid2)
         await send_or_edit(
@@ -311,7 +343,10 @@ async def _dispatch_grab(
 
     # 手动解冻该接单员全部冻结佣金
     if data.startswith("a:gbrel:"):
-        uid2 = int(data[8:])
+        uid2 = _safe_int(data[8:])
+        if uid2 <= 0:
+            await _toast("参数错误", show_alert=True)
+            return True
         released = 0
         for cm in db.list_grab_commissions(grabber_id=uid2, status="frozen", limit=200):
             if grab.release_commission_manual(cm.id, operator_id=uid):
@@ -331,7 +366,10 @@ async def _dispatch_grab(
 
     # 看某接单员的进行中订单
     if data.startswith("a:gbo:"):
-        uid2 = int(data[6:])
+        uid2 = _safe_int(data[6:])
+        if uid2 <= 0:
+            await _toast("参数错误", show_alert=True)
+            return True
         g = db.get_grabber(uid2)
         orders = db.list_grab_orders("grabbed", grabber_id=uid2, limit=10)
         lines = [f"<b>📋 {h(g.display() if g else str(uid2))} 的进行中订单</b>", ""]
@@ -400,7 +438,7 @@ async def _dispatch_grab(
 
     # ---------- 提现审核 ----------
     if data == "a:gwds" or data.startswith("a:gwds:"):
-        page = int(data.split(":")[2]) if data.count(":") == 2 and data.split(":")[2].isdigit() else 0
+        page = _safe_int(data.split(":")[2]) if data.count(":") == 2 else 0
         text, keyboard = page_admin_grab_withdrawals(page)
         await send_or_edit(query, text, keyboard)
         return True
@@ -446,14 +484,18 @@ async def _dispatch_grab(
 
     # ---------- 申诉仲裁 ----------
     if data == "a:gaps" or data.startswith("a:gaps:"):
-        page = int(data.split(":")[2]) if data.count(":") == 2 and data.split(":")[2].isdigit() else 0
+        page = _safe_int(data.split(":")[2]) if data.count(":") == 2 else 0
         text, keyboard = page_admin_grab_appeals(page)
         await send_or_edit(query, text, keyboard)
         return True
 
     if data.startswith("a:gapok:") or data.startswith("a:gapno:"):
         approve = data.startswith("a:gapok:")
-        aid = int(data.split(":")[2])
+        _ap = data.split(":")
+        aid = _safe_int(_ap[2] if len(_ap) > 2 else "")
+        if aid <= 0:
+            await _toast("参数错误", show_alert=True)
+            return True
         a = grab.handle_appeal(aid, uid, approve)
         if a:
             audit(uid, "裁定申诉", f"#{aid} {'支持' if approve else '驳回'}")

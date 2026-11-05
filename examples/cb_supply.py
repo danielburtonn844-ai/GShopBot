@@ -5,7 +5,6 @@
 """
 from __future__ import annotations
 
-import asyncio
 import logging
 
 from telegram.ext import ContextTypes
@@ -43,6 +42,7 @@ from .pages_supply import (
 )
 from .runtime import db, service, stock, supply
 from .supply_service import CREATE_FAIL_REASONS
+from .tasks import spawn
 from .ui import audit, clear_state, h, kb, send_or_edit
 
 logger = logging.getLogger(__name__)
@@ -188,7 +188,7 @@ async def _dispatch_supply(
                 ]),
             )
             return True
-        asyncio.create_task(supply.distribute(post))
+        spawn(supply.distribute(post), name="supply.distribute")
         text = (
             f"✅ <b>发布成功</b>\n\n"
             f"帖子编号：<code>{post.id}</code>\n"
@@ -242,8 +242,8 @@ async def _dispatch_supply(
             await send_or_edit(query, "❌ 帖子不存在或已处理", kb([[("🕐 审核队列", "a:sup:rv")]]))
             return True
         audit(uid, "供需审核通过", pid)
-        asyncio.create_task(supply.distribute(post))
-        asyncio.create_task(supply.notify_user_approved(post))
+        spawn(supply.distribute(post), name="supply.distribute")
+        spawn(supply.notify_user_approved(post), name="supply.approved")
         text, keyboard = page_admin_supply_post(pid)
         await send_or_edit(query, f"✅ 帖子 <code>{pid}</code> 已通过审核，正在分发\n\n" + text, keyboard)
         return True
@@ -255,7 +255,7 @@ async def _dispatch_supply(
             await send_or_edit(query, "❌ 帖子不存在或已处理", kb([[("🕐 审核队列", "a:sup:rv")]]))
             return True
         audit(uid, "供需审核拒绝", pid)
-        asyncio.create_task(supply.notify_user_rejected(post))
+        spawn(supply.notify_user_rejected(post), name="supply.rejected")
         text, keyboard = page_admin_supply_post(pid)
         await send_or_edit(
             query,
@@ -433,7 +433,7 @@ async def _dispatch_supply(
             audit(uid, "补货", f"{(p.name if p else pid)} +{added} 件")
             if p and p.status == "on":
                 # 补货后商品在售 → 通知所有到货提醒订阅者
-                asyncio.create_task(stock.notify_restock(pid))
+                spawn(stock.notify_restock(pid), name="stock.restock")
         text, keyboard = page_admin_pool_prod(pid)
         if added:
             head = f"✅ 补货完成，本次入库 <code>{added}</code> 件；如有到货提醒订阅将自动私信推送"

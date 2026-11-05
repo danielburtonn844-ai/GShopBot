@@ -162,7 +162,10 @@ def test_issue3() -> None:
                encoding="utf-8").read()
 
     check("run_polling 传入 allowed_updates",
-          "run_polling(allowed_updates=ALLOWED_UPDATES)" in src)
+          "allowed_updates=ALLOWED_UPDATES" in src)
+    # v2.7.1（N-P2-5）：默认串行处理 update 会被单个慢请求堵死
+    check("run_polling 开启 concurrent_updates",
+          "concurrent_updates=True" in src)
     check("订阅了 CHAT_MEMBER", "Update.CHAT_MEMBER" in src)
     check("订阅了 MY_CHAT_MEMBER", "Update.MY_CHAT_MEMBER" in src)
     check("订阅了 MESSAGE", "Update.MESSAGE" in src)

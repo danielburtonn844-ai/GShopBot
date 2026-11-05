@@ -39,7 +39,13 @@ _STATE_KEEP_PREFIXES = ("padd_kind:", "padd_mode:", "a:bcsend", "sup:", "a:stkdo
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """按钮回调总入口：建档 → 清状态 → 按命名空间分发 → 未命中兜底回主菜单。"""
     query = update.callback_query
-    await query.answer()
+    # v2.7.0（审计 N-P2-3）：answer() 必须兜底。
+    # 回调超过 15 分钟或已被点过时 Telegram 返回 BadRequest("query is too old")，
+    # 旧实现直接抛出，导致整个 handler 中断——按钮点了没反应、也不报错。
+    try:
+        await query.answer()
+    except Exception as exc:
+        logger.warning("回调应答失败（可能已过期）：%s", exc)
     tg_user = update.effective_user
     uid = tg_user.id
     data = query.data or ""

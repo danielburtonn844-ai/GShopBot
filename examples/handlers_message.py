@@ -39,6 +39,7 @@ from .pages_user import page_recharge_confirm, page_search_results
 from .richtext import rich_from_message
 from .runtime import db, grab, service, stock
 from .shop_service import BUY_FAIL_REASONS
+from .tasks import spawn
 from .ui import audit, clear_state, h, kb, order_status_text, summarize_message
 
 logger = logging.getLogger(__name__)
@@ -211,7 +212,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         # v2.6.0：报单内容自动派到接单群（商品走库存池自动发货，不派单）；
         # 匿名卡片不含买家信息，接单员抢单后深链回机器人回单
         if grab.enabled():
-            asyncio.create_task(grab.dispatch_order(order))
+            spawn(grab.dispatch_order(order), name="grab.dispatch")
         text = (
             f"✅ <b>报单成功</b>\n\n"
             f"订单号：<code>{order.id}</code>\n"
@@ -547,8 +548,9 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             if cap:
                 buf["caption"] = cap
             buf["version"] += 1
-            asyncio.get_event_loop().create_task(
-                _album_commit_later(context.bot, message.chat_id, context.user_data, pid, mgid, buf["version"], uid)
+            spawn(
+                _album_commit_later(context.bot, message.chat_id, context.user_data, pid, mgid, buf["version"], uid),
+                name="stock.album_commit",
             )
             return
 

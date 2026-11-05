@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -30,9 +31,25 @@ def fmt_time(iso_str: str | None) -> str:
     return iso_str[:19].replace("T", " ")
 
 
-def gen_recharge_id() -> str:
-    """充值单号：ORDER_日期_随机段，与 OkPay 的 unique_id 一一对应。"""
-    return f"ORDER_{datetime.now(LOCAL_TZ).strftime('%Y%m%d')}_{uuid.uuid4().hex[:8].upper()}"
+def gen_recharge_id(gateway: str = "") -> str:
+    """充值单号：RC_渠道_日期_随机段。
+
+    v2.7.1（审计 N-P2-13）：原来统一用 `ORDER_` 前缀，而商城订单号是
+    `YYYYMMDD-NNN`，客服/管理员在后台搜单号时两者视觉上都是「一串带日期
+    的编号」，经常把充值单当订单查、或反过来。改成分域前缀：
+
+        RC_OP_20261105_A1B2C3D4   普通充值（OkPay）
+        RC_KK_20261105_A1B2C3D4   KKPay
+        RC_TRC20_20261105_A1B2C3D4 冷钱包 TRON
+        RC_TON_20261105_A1B2C3D4   冷钱包 TON
+
+    历史订单号（ORDER_ 开头）不受影响：单号只用于展示与查单，不做解析，
+    老数据照常能搜到、能对账。
+    """
+    tag = (gateway or "").strip().upper()
+    tag = {"OKPAY": "OP", "KKPAY": "KK", "TRC20": "TRC20", "TRON": "TRC20", "TON": "TON"}.get(tag, tag or "OP")
+    date = datetime.now(LOCAL_TZ).strftime("%Y%m%d")
+    return f"RC_{tag}_{date}_{uuid.uuid4().hex[:8].upper()}"
 
 
 def gen_product_id() -> str:
@@ -57,6 +74,30 @@ def format_duration(seconds: float) -> str:
     hours = seconds // 3600
     minutes = (seconds % 3600) // 60
     return f"{hours}h {minutes}m"
+
+
+def safe_float(raw, default: float = 0.0, minimum: float = 0.0, maximum: float = 1e9) -> float:
+    """把配置值安全转成有限浮点数（拒绝 nan / inf / 非法字符串 / 越界）。
+
+    为什么需要：管理端「抢单设置」把数值当字符串存进 settings 表，读取侧
+    直接 `float(s.get(...))`。一旦库里已经是 `inf`（历史脏数据、或旧版本
+    没有输入校验时写进去的），`float('inf')` 会正常返回 inf，然后在
+    `timedelta(hours=inf)` 处抛 `OverflowError: cannot convert float infinity
+    to integer`——整个派单/完单流程中断，而且报错位置离根因很远，极难排查。
+    nan 更隐蔽：`nan > 0` 为 False，冻结逻辑会被静默跳过。
+
+    参数：minimum/maximum 做区间夹取，超界直接返回 default（不做 clamp，
+    避免把「管理员填了 999999」静默改成 1e9 后语义全变）。
+    """
+    try:
+        value = float(str(raw).strip() if raw is not None else default)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(value):
+        return default
+    if value < minimum or value > maximum:
+        return default
+    return value
 
 
 def escape_html(text: str | None) -> str:
@@ -156,5 +197,5 @@ __all__ = [
     "COMMISSION_STATUS", "WITHDRAW_STATUS", "APPEAL_STATUS", "now_iso",
     "now_str", "fmt_time", "gen_recharge_id", "gen_product_id",
     "gen_supply_id", "format_usdt", "format_duration", "escape_html",
-    "gen_withdraw_id",
+    "gen_withdraw_id", "safe_float",
 ]

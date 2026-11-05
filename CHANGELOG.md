@@ -1,5 +1,52 @@
 # CHANGELOG — G Shop Bot
 
+## v2.7.1 · 2026-11-05
+
+> 承接 v2.7.0，收掉二次深挖审计里的 P2 批次：回调解析健壮性、后台任务生命周期、
+> 分页复杂度、备份一致性、配置脏数据、单号分域。全部为不影响业务语义的加固，
+> 新增 `test_p2_fixes.py` 61 项回归。
+
+### 回调与输入健壮性
+- **回调参数安全解析**（审计 N-P2-2）。`cb_grab.py` 15 处裸 `int(data[7:])` / `int(parts[2])`
+  统一收口到 `_safe_int()`：历史消息里残留的旧格式按钮、被构造的 `callback_data`
+  不再抛 `ValueError` 中断整个 handler（表现为「点了没反应」）。
+- **`query.answer()` 兜底**（审计 N-P2-3）。回调超过 15 分钟或已被点过时 Telegram 返回
+  `BadRequest("query is too old")`，旧实现直接抛出导致 handler 中断；现改为记 warning 继续。
+- **申诉归属与重复提交**（审计 N-P2-1）。`create_appeal` 新增三层校验：订单存在 /
+  `order.grabber_id` 与申诉人不符时拒绝 / 同订单已有 `pending` 申诉时拒绝。
+
+### 并发与任务生命周期
+- **`run_polling(concurrent_updates=True)`**（审计 N-P2-5）。默认串行处理 update，
+  一个慢请求（群发、图册上传、链上查询）会把后面所有用户的操作全堵住。
+- **后台任务持留引用**（审计 N-P2-6 / N-P2-7）。新增 `examples/tasks.py`，13 处裸
+  `asyncio.create_task` 全部改为 `spawn()`：模块级 set 持留引用防 GC，`add_done_callback`
+  统一记异常，`drain()` 在 `post_shutdown` 里等完在跑的任务。顺带把
+  `asyncio.get_event_loop()`（3.12 已弃用）换成 `get_running_loop()`。
+- **支付客户端连接池释放**（审计 N-P2-4）。`ShopService.aclose()` 关闭 OkPay/KKPay 的
+  常驻 `httpx.AsyncClient`，接进 `post_shutdown`，进程反复重启不再累积半开连接。
+
+### 性能
+- **`iter_users` 改游标分页**（审计 N-P2-8）。`OFFSET n` 每次扫过前 n 行，10 万人全量广播
+  是 O(n²)；改为 `(created_at, user_id)` keyset 续传，并补 `idx_users_created_uid` 索引。
+  同时用 `COALESCE` 兜住 `created_at` 为 NULL 的老数据（否则会静默漏人）。
+
+### 数据可靠性
+- **备份改 SQLite backup API**（审计 N-P2-9）。`shutil.copy2` 在 WAL 下有竞争窗口，可能
+  拿到「主库旧页 + WAL 新页」的混合体。改用页级一致快照，文件名加毫秒（同秒连点不再
+  互相覆盖），备份完做 `PRAGMA integrity_check`，不通过即删除并抛错。
+- **`ADMIN_ID` 解析加固**（审计 N-P2-10）。`ADMIN_ID=` / `ADMIN_ID=abc` 不再抛 `ValueError`
+  导致进程起不来；缺失时也不再往 `admins` 表写 `user_id=0` 的脏档案。
+- **配置数值拒绝 inf/nan**（审计 N-P2-12）。新增 `safe_float()`，`grab_timeout_hours` /
+  `grab_freeze_hours` 读到 `inf` 时不再让 `timedelta(hours=inf)` 抛 `OverflowError`。
+- **充值单号分域前缀**（审计 N-P2-13）。`ORDER_` 改为 `RC_OP_` / `RC_KK_` / `RC_TRC20_` /
+  `RC_TON_`，与商城订单号 `YYYYMMDD-NNN` 彻底区分；历史单号照常可查。
+
+### 自检
+- 新增 `test_p2_fixes.py`（61 项）：覆盖上述 9 项修复的边界与回归。
+- `test_bot_full.py` 7209 项 / `test_extra.py` 85 项 / `test_coverage_boost.py` 75 项 /
+  `verify_issues.py` 48 项（新增 `concurrent_updates` 断言），全部通过。
+- `ruff check examples main.py` → `All checks passed!`；`compileall` 通过。
+
 ## v2.7.0 · 2026-11-05
 
 > 本版本以两份审计报告（完整审计 69 项缺陷 + 二次深挖增量）为输入，集中修复订单状态机、

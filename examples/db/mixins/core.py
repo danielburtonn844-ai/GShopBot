@@ -462,6 +462,9 @@ class CoreMixin:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_orders_created ON orders(created_at)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_recharge_status_created ON recharges(status, created_at)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_gc_status_created ON grab_commissions(status, created_at)")
+            # 用户全量遍历（广播/全量提醒）走 (created_at, user_id) 游标分页，
+            # 没有这条索引就是每批一次全表扫描。
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_users_created_uid ON users(created_at, user_id)")
             conn.commit()
 
             # 迁移：老库的 recharges 表补 gateway 列（支付渠道，老数据默认 okpay）。

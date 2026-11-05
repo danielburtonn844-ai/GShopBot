@@ -14,7 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import shutil
+import sqlite3
 from datetime import datetime, timedelta
 
 from .models import LOCAL_TZ
@@ -164,21 +164,49 @@ async def daily_report() -> None:
 # ==================================================================
 
 def do_backup() -> str:
-    """立即备份数据库，返回备份文件路径（供定时任务与「a:backup」按钮共用）。"""
+    """立即备份数据库，返回备份文件路径（供定时任务与「a:backup」按钮共用）。
+
+    v2.7.1 改了三处（审计 N-P2-9）：
+
+    1) 用 SQLite 官方 backup API 代替 `shutil.copy2`。`copy2` 在 WAL 模式下
+       即使先 checkpoint 也存在竞争窗口：复制到一半如果刚好有写入提交，
+       拿到的库可能是「主库旧页 + WAL 新页」的混合体，打开就报
+       `database disk image is malformed`。backup API 走页级一致快照，
+       且允许源库继续读写，不需要停服。
+    2) 文件名带毫秒。原来只到秒，同一秒内连点两次备份会互相覆盖，
+       第二次写的可能是半成品。
+    3) 备份完做一次 `PRAGMA integrity_check`，不通过就删掉这个文件并抛错——
+       比留着一个坏备份等真出事时才发现要好。
+    """
     os.makedirs(BACKUP_DIR, exist_ok=True)
-    stamp = datetime.now(LOCAL_TZ).strftime("%Y%m%d_%H%M%S")
+    stamp = datetime.now(LOCAL_TZ).strftime("%Y%m%d_%H%M%S_%f")[:-3]
     dest = os.path.join(BACKUP_DIR, f"shop_{stamp}.db")
     db_path = str(db.path) if hasattr(db, "path") else os.path.join(BASE_DIR, "data", "shop.db")
-    # WAL 模式下先 checkpoint 再复制，保证备份完整
+
+    src = sqlite3.connect(db_path)
     try:
-        conn = db._get_conn()
+        out = sqlite3.connect(dest)
         try:
-            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            src.backup(out)
         finally:
-            conn.close()
-    except Exception as exc:
-        logger.warning("备份前 checkpoint 失败（继续复制）：%s", exc)
-    shutil.copy2(db_path, dest)
+            out.close()
+    finally:
+        src.close()
+
+    # 校验备份可用性：integrity_check 返回单行 'ok' 才算合格
+    try:
+        chk = sqlite3.connect(dest)
+        try:
+            result = chk.execute("PRAGMA integrity_check").fetchone()
+        finally:
+            chk.close()
+    except sqlite3.Error as exc:
+        _remove_quietly(dest)
+        raise RuntimeError(f"备份文件无法打开：{exc}") from exc
+    if not result or result[0] != "ok":
+        _remove_quietly(dest)
+        raise RuntimeError(f"备份文件校验失败：{result[0] if result else 'no result'}")
+
     # 只保留最近 BACKUP_KEEP 份
     try:
         files = sorted(
@@ -186,10 +214,17 @@ def do_backup() -> str:
             reverse=True,
         )
         for old in files[BACKUP_KEEP:]:
-            os.remove(os.path.join(BACKUP_DIR, old))
+            _remove_quietly(os.path.join(BACKUP_DIR, old))
     except Exception as exc:
         logger.warning("清理旧备份失败：%s", exc)
     return dest
+
+
+def _remove_quietly(path: str) -> None:
+    try:
+        os.remove(path)
+    except OSError:
+        pass
 
 
 async def auto_backup() -> None:

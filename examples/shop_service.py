@@ -36,6 +36,7 @@ from .models import (
     gen_product_id,
     gen_recharge_id,
     now_iso,
+    safe_float,
 )
 from .okpay import OkPay
 from .richtext import (
@@ -84,6 +85,24 @@ class ShopService:
         self._bot = None
         self._okpay: OkPay | None = None  # 懒加载并复用，避免每次请求新建连接
         self._kkpay: KKPay | None = None
+
+    async def aclose(self) -> None:
+        """释放支付客户端的常驻连接池（停机时调用）。
+
+        OkPay/KKPay 内部各持有一个 `httpx.AsyncClient`，懒加载后一直复用，
+        连接池永不关闭。进程反复重启/热重载时，旧连接既不回收也不发
+        `Connection: close`，服务端侧会持续累积半开连接直到打满。
+        这里在 post_shutdown 里统一 aclose。
+        """
+        for name in ("_okpay", "_kkpay"):
+            client = getattr(self, name, None)
+            if client is None:
+                continue
+            try:
+                await client.close()
+            except Exception as exc:  # 关闭失败不能阻断停机流程
+                logger.warning("关闭支付客户端 %s 失败：%s", name, exc)
+            setattr(self, name, None)
 
     def _get_okpay(self) -> OkPay:
         if self._okpay is None:
@@ -426,7 +445,8 @@ class ShopService:
             return
         if self.db.get_commission_by_order(order_id, conn=conn):
             return  # 已有佣金记录（frozen/released/voided），不重复结
-        freeze_h = float(self.db.get_settings().get("grab_freeze_hours", 24) or 0)
+        # safe_float 拒绝 inf/nan（N-P2-12）：inf 会让下面的 timedelta 抛 OverflowError
+        freeze_h = safe_float(self.db.get_settings().get("grab_freeze_hours", 24), 24, 0, 8760)
         frozen_until = "" if freeze_h <= 0 else (
             datetime.now(LOCAL_TZ) + timedelta(hours=freeze_h)
         ).isoformat()
@@ -588,7 +608,8 @@ class ShopService:
 
     # ---------- 充值 ----------
 
-    def create_recharge(self, user_id: int, amount: float) -> Recharge | None:
+    def create_recharge(self, user_id: int, amount: float, gateway: str = "okpay") -> Recharge | None:
+        """创建充值单。gateway 只用于生成带渠道前缀的单号（N-P2-13）。"""
         # 安全兜底：限额校验在这里做死，任何渠道/入口都绕不过
         if self.validate_recharge_amount(amount):
             logger.warning("拒绝越限充值单：user=%s amount=%s", user_id, amount)
@@ -601,7 +622,7 @@ class ShopService:
 
         user = self.db.get_user(user_id)
         recharge = Recharge(
-            id=gen_recharge_id(),
+            id=gen_recharge_id(gateway),
             user_id=user_id,
             username=user.username if user else "",
             amount=amount,
@@ -623,7 +644,7 @@ class ShopService:
             gateway = "okpay"  # 冷钱包渠道走 create_chain_recharge，不进支付平台
         if not self.gateway_available(gateway):
             return None, None  # 渠道被后台关闭或未配置，拒绝下单
-        recharge = self.create_recharge(user_id, amount)
+        recharge = self.create_recharge(user_id, amount, gateway)
         if not recharge:
             return None, None
 
@@ -780,7 +801,7 @@ class ShopService:
                 points_base = expected            # 积分按实际应付（含尾数）换算
 
             recharge = Recharge(
-                id=gen_recharge_id(),
+                id=gen_recharge_id(chain),
                 user_id=user_id,
                 username=user.username if user else "",
                 amount=pay_amount,

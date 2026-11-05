@@ -42,6 +42,7 @@ from .richtext import (
     TG_STAR,
     send_html,
 )
+from .tasks import spawn
 
 logger = logging.getLogger(__name__)
 
@@ -375,7 +376,7 @@ class SupplyService:
         nth = self.db.count_user_supply_posts(post.user_id)
         text = self.format_post_text(post, nth)
         if post.channel in ("bot", "both"):
-            asyncio.create_task(self._broadcast_bot(post, text))
+            spawn(self._broadcast_bot(post, text), name="supply.broadcast")
         if post.channel in ("channel", "both"):
             await self._send_to_channel(post, text)
 

@@ -105,15 +105,32 @@ class UserMixin:
         用户永远收不到广播，且没有任何报错。改成按 created_at + user_id 稳定
         分页，保证不漏人，同时每批只占 batch 条内存。
         """
-        offset = 0
+        # 游标分页（keyset）：用 (created_at, user_id) 做续传点，不用 OFFSET。
+        # OFFSET n 每次都要扫过前 n 行，全表 10 万人 × 200 批就是 O(n²)，
+        # 广播时数据库 CPU 打满；游标版每批都是索引定位，总代价 O(n)。
+        last_created = ""
+        last_uid = 0
         while True:
-            rows = self.list_users(limit=batch, offset=offset)
+            conn = self._get_conn()
+            try:
+                rows = conn.execute(
+                    "SELECT * FROM users "
+                    "WHERE (COALESCE(created_at, '') > ?) "
+                    "   OR (COALESCE(created_at, '') = ? AND user_id > ?) "
+                    "ORDER BY COALESCE(created_at, '') ASC, user_id ASC LIMIT ?",
+                    (last_created, last_created, last_uid, batch),
+                ).fetchall()
+            finally:
+                conn.close()
             if not rows:
                 return
-            yield rows
-            if len(rows) < batch:
+            users = [User.from_dict(dict(r)) for r in rows]
+            yield users
+            if len(users) < batch:
                 return
-            offset += batch
+            last = users[-1]
+            last_created = last.created_at or ""
+            last_uid = last.user_id
 
     # ---------- 商品 ----------
 

@@ -27,7 +27,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
 import sys
@@ -56,6 +55,7 @@ from examples.jobs import (
     daily_report,
 )
 from examples.runtime import ADMIN_ID, BOT_TOKEN, VERSION, grab, service, stock
+from examples.tasks import drain, spawn
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -66,11 +66,24 @@ logger = logging.getLogger(__name__)
 
 async def post_init(app: Application) -> None:
     """启动后拉起常驻后台任务（每个任务内部自带异常兜底，不会退出）。"""
-    asyncio.create_task(auto_check_recharges())
-    asyncio.create_task(auto_check_chain_recharges())  # v2.5.0 冷钱包链上监听
-    asyncio.create_task(auto_grab_housekeeping())      # v2.6.0 抢单超时/预警/佣金解冻
-    asyncio.create_task(daily_report())
-    asyncio.create_task(auto_backup())
+    # 全部走 tasks.spawn() 持留引用：裸 create_task 的返回值没人接，
+    # 事件循环只持弱引用，任务可能被 GC 掉，常驻轮询会静默消失。
+    spawn(auto_check_recharges(), name="job.recharges")
+    spawn(auto_check_chain_recharges(), name="job.chain")   # v2.5.0 冷钱包链上监听
+    spawn(auto_grab_housekeeping(), name="job.grab")        # v2.6.0 抢单超时/预警/佣金解冻
+    spawn(daily_report(), name="job.daily_report")
+    spawn(auto_backup(), name="job.backup")
+
+
+async def post_shutdown(app: Application) -> None:
+    """停机收尾：把还在跑的后台任务（图册提交/群发/通知）等完再退。
+
+    注意必须在 post_shutdown 里做，不能在 run_polling 返回后做：
+    run_polling 返回时事件循环已关闭，那些 task 已经无法再被 await。
+    """
+    await drain(timeout=10.0)
+    # 释放 OkPay/KKPay 的常驻 httpx 连接池（N-P2-4）
+    await service.aclose()
 
 
 async def on_grab_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -130,7 +143,13 @@ def main() -> None:
         logger.error("请在 .env 中设置 BOT_TOKEN")
         sys.exit(1)
 
-    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
     # supply 复用 shop 的 bot（见 SupplyService._shop），无需单独注入
     service.set_bot(app.bot)
     stock.set_bot(app.bot)
@@ -152,7 +171,11 @@ def main() -> None:
     logger.info("🤖 G Shop Bot v%s 已启动（模块化版）", VERSION)
     logger.info("管理员 ID: %s", ADMIN_ID)
 
-    app.run_polling(allowed_updates=ALLOWED_UPDATES)
+    # concurrent_updates=True：默认 PTB 串行处理 update，一个慢请求（群发、
+    # 图册上传、链上查询）会把后面所有用户的操作全堵住，表现为
+    # 「点了没反应」甚至回调超时 15 分钟后全部失效。开启后每个 update
+    # 独立 task 处理，互不阻塞。
+    app.run_polling(allowed_updates=ALLOWED_UPDATES, concurrent_updates=True)
 
 
 if __name__ == "__main__":
