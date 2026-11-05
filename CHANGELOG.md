@@ -1,5 +1,72 @@
 # CHANGELOG — G Shop Bot
 
+## v2.8.1 · 2026-11-06
+
+> v2.8.0 发布后复核出的 4 个业务硬伤。全是「代码里有、线上走不到」或
+> 「看着修过、其实没修干净」的类型，逐条有实测证据。
+
+### 严重缺陷
+
+- **补单入口为零（审计 N-P0-2 未真正闭环）**。`complete_recharge` 在 v2.7.0 已
+  支持 `pending` / `failed` / `expired` 三态补账，但全仓生产代码**零调用**，后台也
+  没有任何列表页能翻出这些单。冷钱包超过 `CHAIN_GRACE_HOURS = 72` 小时会被
+  `check_chain_recharges` 置 `expired` 并移出自动匹配池——钱在链上、单在库里，
+  管理员却无处可点，等于永久丢账。
+  现在补上：财务概览页新增「🧾 待核对充值（N）」入口 → 三态单一页列全 →
+  逐单「🔍 核对」看用户/金额/渠道/链/txid → 「✅ 确认补账」走
+  `complete_recharge` 同一事务口径（加积分 + 记流水 + 写业务事件），全程
+  `a:` 前缀权限闸门 + 操作日志留痕。
+
+- **负价商品白送积分（资金漏洞）**。旧版只在 `handlers_message.py` 的
+  `_EDITABLE_PRODUCT_FIELDS["points"] = ("int", 1, 10_000_000)` 这层 UI 白名单限了，
+  `create_product` 与 `_validate_purchase` 零校验。负价商品下单时
+  `update_user_points(user_id, -product.points)` 变成**加分**，等于无限白送；
+  0 价商品会把 `total_spent` 统计污染成负数。
+  现在服务层无条件兜底：`_validate_purchase` **最前置**拦截（早于一切状态判断），
+  `create_product` 入库前把价格钉成正整数、负数/0 直接 `ValueError` 拒写库，
+  新增原因码 `bad_price`「商品价格异常，已暂停售卖，请联系管理员」。
+
+- **拉群即接管（越权）**。`grab_service.handle_bot_added` 的 `if not current:`
+  分支在从未配置过接单群时，**任何人**建个群把机器人拉进去，就自动写死
+  `grab_chat_id` + `grab_enabled=1`——全站报单流与买家备注（含联系方式）
+  直接改投到陌生人建的群，零鉴权，注释还写着「零配置」。
+  现在改成必须管理员在通知上点「✅ 设为本群」才生效（复用 `a:guse:` 回调，
+  它在 `a:` 权限闸门后面）；同时给 `confirm_grab_chat` 加格式硬校验，
+  群 ID 必须是以 `-` 开头的数字串，非法值直接拒绝并留 warning 日志。
+
+- **`save_order` / `save_user` 仍会丢更新（N-P0-1 上一版没真修）**。
+  v2.7.0 把「全 28 列 upsert」改成「与数据库当前值逐列比对，只 UPDATE 不同的列」，
+  docstring 宣称「从根上消灭丢更新」。但**比对基准选错了**：
+
+  ```
+  流程 A 读出 status=pending
+  流程 B 改成 processing 并落库
+  流程 A 只改了 note，回来 save
+  → 旧实现发现 库(processing) != 快照(pending)，误判成「A 改过 status」
+  → 把 status 写回 pending，B 的处理中状态被覆盖
+  ```
+
+  现在每个 `User` / `Order` 从库里读出来时记一份 `_baseline` 原始快照
+  （不落库、不进 `to_dict`、不参与 `repr`/`==`），save 时只写「当前值 != 基线」
+  的列——也就是本对象真正动过的列。期间被谁改过都不影响。同时把两处
+  docstring 从「已根除」改成实话，附上具体触发时序。
+
+### 依赖锁完备性
+
+- `requirements.lock` 补 `exceptiongroup==1.3.1; python_version < '3.11'`。
+  `anyio==4.16.0` 在 Python < 3.11 上依赖 `exceptiongroup`（3.11+ 有原生
+  `ExceptionGroup` 故不装），锁文件漏了这一条，`--require-hashes` 在 3.10 上
+  直接 abort，导致 v2.8.0 首跑 CI 只有 3.10 job 红、3.11/3.12 全绿。
+  这条缺陷在单一版本本地验证里看不出来，只有跑全矩阵才暴露。
+
+### 发版规范
+
+- v2.8.0 的 tag 指向 `09c64fcf`，而该 commit 的 CI 是 **failure**（修复在
+  其后的 `e176fb06` / `3eae6169`）。打 tag 前必须确认 `main` HEAD 的 CI 已绿，
+  v2.8.1 起遵守这条。
+
+---
+
 ## v2.8.0 · 2026-11-05
 
 > 承接 v2.7.1，按《GShopBot-完整审计与改造需求》与《二次深挖增量审计》把 P2 批次收完。

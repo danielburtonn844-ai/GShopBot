@@ -527,6 +527,85 @@ def page_admin_payment() -> tuple[str, InlineKeyboardMarkup]:
     return "\n".join(lines), kb(buttons)
 
 
+RECHARGE_PAGE_SIZE = 8
+
+
+def page_admin_recharges(page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
+    """待核对充值（v2.8.1 审计 N-P0-2：补单入口）。
+
+    冷钱包单超过 CHAIN_GRACE_HOURS 会被 check_chain_recharges 置 expired 并
+    移出自动匹配池，此时钱已在链上、系统里却只剩一条不再参与匹配的死单。
+    v2.7.0 让 complete_recharge 接受了 failed / expired，但后台从来没有入口
+    能调到它——「代码能补、人补不了」等于没补。这里把三态单全列出来。
+    """
+    statuses = db.OPEN_RECHARGE_STATES
+    total = db.count_recharges_multi(statuses)
+    rows = db.list_recharges_multi(
+        statuses, limit=RECHARGE_PAGE_SIZE, offset=page * RECHARGE_PAGE_SIZE
+    )
+    lines = [
+        f"<b>🧾 待核对充值</b>（共 <code>{total}</code> 笔）",
+        "<i>⏳ 待支付 · ❌ 下单失败/超时标失败 · ⌛ 冷钱包超期未匹配</i>",
+        "<i>链上或支付平台已确认到账的点「确认补账」，与自动到账同一事务口径</i>",
+        "",
+    ]
+    if not rows:
+        lines.append("暂无待核对充值单 🎉")
+    mark = {"pending": "⏳", "failed": "❌", "expired": "⌛"}
+    for r in rows:
+        who = f"@{h(r.username)}" if r.username else f"<code>{r.user_id}</code>"
+        lines.append(
+            f"{mark.get(r.status, '❓')} <code>{h(r.id)}</code> · "
+            f"<code>{r.amount:g}</code> USDT → <code>{r.points}</code> 积分"
+        )
+        extra = f" · 链 <code>{h(r.chain)}</code>" if r.chain else ""
+        lines.append(
+            f"    {who} · {h(r.gateway or '-')}{extra} · <code>{fmt_time(r.created_at)[:16]}</code>"
+        )
+    buttons: list[list[tuple[str, str]]] = []
+    for r in rows:
+        buttons.append([(f"🔍 核对 {r.id}", f"a:rcq:{r.id}")])
+    nav: list[tuple[str, str]] = []
+    if page > 0:
+        nav.append(("⬅️ 上一页", f"a:rcl:{page - 1}"))
+    if (page + 1) * RECHARGE_PAGE_SIZE < total:
+        nav.append(("➡️ 下一页", f"a:rcl:{page + 1}"))
+    if nav:
+        buttons.append(nav)
+    buttons.append([("⬅️ 返回财务", "a:fin")])
+    return "\n".join(lines), kb(buttons)
+
+
+def page_admin_recharge_confirm(recharge_id: str) -> tuple[str, InlineKeyboardMarkup]:
+    """补账二次确认页：打给谁、打多少、凭证是什么，先看清再点。"""
+    r = db.get_recharge(recharge_id)
+    if not r:
+        return "❌ 充值单不存在（可能已被处理）", kb([[("⬅️ 返回列表", "a:rcl")]])
+    user = db.get_user(r.user_id)
+    who = f"@{h(user.username)}" if (user and user.username) else f"<code>{r.user_id}</code>"
+    lines = [
+        "<b>⚠️ 确认补账</b>",
+        "<i>此操作立即加积分并记流水，与自动到账完全相同，执行后不可撤销</i>",
+        "",
+        f"充值单：<code>{h(r.id)}</code>",
+        f"状态：<code>{h(r.status)}</code> · 渠道：<code>{h(r.gateway or '-')}</code>",
+        f"金额：<code>{r.amount:g}</code> USDT → <code>{r.points}</code> 积分",
+        f"用户：{who}（<code>{r.user_id}</code>）",
+        f"创建：<code>{fmt_time(r.created_at)}</code>",
+    ]
+    if r.chain:
+        lines.append(f"链：<code>{h(r.chain)}</code> · 应付：<code>{h(r.expected_amount or '-')}</code>")
+    if r.txid:
+        lines.append(f"txid：<code>{h(r.txid)}</code>")
+    if r.okpay_order_id:
+        lines.append(f"平台单号：<code>{h(r.okpay_order_id)}</code>")
+    buttons = [
+        [("✅ 确认补账", f"a:rcc:{r.id}")],
+        [("⬅️ 返回列表", "a:rcl")],
+    ]
+    return "\n".join(lines), kb(buttons)
+
+
 def page_admin_finance() -> tuple[str, InlineKeyboardMarkup]:
     stats = service.get_finance_stats()
     lines = [
@@ -550,7 +629,12 @@ def page_admin_finance() -> tuple[str, InlineKeyboardMarkup]:
         "",
         f"🗄 库存池：<code>{stats['pool_products']}</code> 个池商品 · 现货 <code>{stats['available']}</code> 件 · 已售 <code>{stats['sold']}</code> 件",
     ]
+    open_recharges = db.count_recharges_multi(db.OPEN_RECHARGE_STATES)
+    if open_recharges:
+        lines.append("")
+        lines.append(f"🧾 待核对充值：<code>{open_recharges}</code> 笔（链上/平台已付可人工补账）")
     buttons = [
+        [(f"🧾 待核对充值（{open_recharges}）", "a:rcl")],
         [("📦 库存池", "a:pool"), ("📜 操作日志", "a:logs")],
         [("⬅️ 返回", "m:admin")],
     ]

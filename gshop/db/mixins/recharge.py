@@ -75,6 +75,54 @@ class RechargeMixin(ConnAccessMixin):
     def list_pending_recharges(self, limit: int = 200) -> list[Recharge]:
         return self.list_recharges(status="pending", limit=limit)
 
+    # ---------- v2.8.1 补单入口（审计 N-P0-2） ----------
+
+    OPEN_RECHARGE_STATES = ("pending", "failed", "expired")
+
+    def count_recharges_multi(self, statuses: tuple[str, ...]) -> int:
+        """按多状态计数（补单页的分页总数）。"""
+        if not statuses:
+            return 0
+        marks = ", ".join("?" for _ in statuses)
+        conn = self._get_conn()
+        try:
+            row = conn.execute(
+                f"SELECT COUNT(*) FROM recharges WHERE status IN ({marks})",
+                tuple(statuses),
+            ).fetchone()
+            return int(row[0]) if row else 0
+        finally:
+            conn.close()
+
+    def list_recharges_multi(
+        self, statuses: tuple[str, ...], limit: int = 50, offset: int = 0
+    ) -> list[Recharge]:
+        """按多状态列充值单（v2.8.1）。
+
+        补单页面要同时看 pending / failed / expired 三态：pending 是正常待支付、
+        failed 是下单失败或超时标失败、expired 是冷钱包超过宽限期仍未匹配到。
+        后两种都可能已经真的收到钱，必须能被管理员翻出来补账。
+
+        单独开一个方法、不改 list_recharges 的签名，是为了让现有的
+        pages_user / jobs / shop_service 调用点行为完全不变。
+        """
+        if not statuses:
+            return []
+        marks = ", ".join("?" for _ in statuses)
+        params: list[Any] = list(statuses)
+        params.append(max(1, int(limit)))
+        params.append(max(0, int(offset)))
+        conn = self._get_conn()
+        try:
+            rows = conn.execute(
+                f"SELECT * FROM recharges WHERE status IN ({marks})"
+                " ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                params,
+            ).fetchall()
+            return [Recharge.from_dict(dict(r)) for r in rows]
+        finally:
+            conn.close()
+
     def pending_tron_suffixes(
         self, base_amount: int, conn: sqlite3.Connection | None = None
     ) -> set[int]:

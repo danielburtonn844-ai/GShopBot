@@ -67,6 +67,9 @@ BUY_FAIL_REASONS = {
     "limit": "已达限购数量",
     "banned": "账号已被限制，无法购买",
     "points": "积分不足",
+    # v2.8.1：价格非法（<=0）。0 价商品同样要拒——它会污染 total_spent 统计口径，
+    # 且「免费领」在财务上等价于负价漏洞的人工版。
+    "bad_price": "商品价格异常，已暂停售卖，请联系管理员",
 }
 
 logger = logging.getLogger(__name__)
@@ -261,6 +264,19 @@ class ShopService:
     # ---------- 商品 ----------
 
     def create_product(self, data: dict[str, Any]) -> Product:
+        """上架条目。
+
+        v2.8.1：入库前把价格钉成正整数。上架向导（handlers_message）已经限了
+        区间，但后台脚本 / 旧数据导入 / 直接调 service 的路径不经过 UI，
+        这里做最后一道闸——负数或 0 一律拒绝，不写库。
+        """
+        try:
+            _price = int(data.get("points", 0) or 0)
+        except (TypeError, ValueError):
+            raise ValueError("商品价格必须是整数") from None
+        if _price <= 0:
+            raise ValueError("商品价格必须大于 0")
+        data = {**data, "points": _price}
         product = Product(
             id=data.get("id") or gen_product_id(),
             name=data.get("name", ""),
@@ -316,9 +332,21 @@ class ShopService:
         return self.db.count_stock_items(product_id, "available")
 
     def _validate_purchase(self, user: User | None, product: Product | None, conn=None) -> str | None:
-        """购买前置校验。返回 None 表示可购买，否则返回原因码（见 BUY_FAIL_REASONS）。"""
+        """购买前置校验。返回 None 表示可购买，否则返回原因码（见 BUY_FAIL_REASONS）。
+
+        v2.8.1：价格兜底放在最前面，早于一切状态判断。负价商品会让
+        `update_user_points(user_id, -product.points)` 变成加分，等于白送积分；
+        这是收钱链路上的资金漏洞，必须在服务层无条件挡住，不能只靠后台 UI 白名单。
+        """
         if not product or product.status == "off":
             return "not_found"
+        # 价格必须为正整数。这里用 try 兼容从 SQLite 读出的字符串/None。
+        try:
+            _price = int(product.points)
+        except (TypeError, ValueError):
+            return "bad_price"
+        if _price <= 0:
+            return "bad_price"
         is_report = product.kind == "report"
         if product.status == "sold_out" and not is_report:
             return "sold_out"  # 售罄要如实告知，不能报「不存在」误导用户

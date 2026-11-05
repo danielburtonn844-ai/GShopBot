@@ -24,6 +24,9 @@ class User:
     invited_by: str = ""
     created_at: str = ""
     last_active: str = ""
+    # v2.8.1：从库里读出来时的原始值快照。save_user 用它判断「本对象到底
+    # 改过哪些列」。不落库、不进 to_dict、不参与 repr / ==。
+    _baseline: dict[str, Any] | None = field(default=None, repr=False, compare=False)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -43,7 +46,7 @@ class User:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> User:
-        return cls(
+        obj = cls(
             user_id=data.get("user_id", 0),
             username=data.get("username", "") or "",
             first_name=data.get("first_name", "") or "",
@@ -57,6 +60,10 @@ class User:
             created_at=data.get("created_at", "") or "",
             last_active=data.get("last_active", "") or "",
         )
+        # 刚读出来的对象是干净的：把当前值记成基线，之后任何赋值都会
+        # 表现为「当前值 != 基线」，从而被 save_user 识别成本次真正改过的列。
+        obj._baseline = obj.to_dict()
+        return obj
 
 
 @dataclass
@@ -157,6 +164,9 @@ class Order:
     dispatch_count: int = 0         # 已派单次数（>1 表示重发过/释放重派过）
     last_dispatch_at: str = ""      # 最近一次派单时间（二次提醒判断用）
     warn_sent: int = 0              # 临期预警是否已发（0/1，防重复轰炸）
+    # v2.8.1：读库时的原始值快照，save_order 用它判断本对象改过哪些列。
+    # 不落库、不进 to_dict、不参与 repr / ==。
+    _baseline: dict[str, Any] | None = field(default=None, repr=False, compare=False)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -192,7 +202,7 @@ class Order:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Order:
-        return cls(
+        obj = cls(
             id=data.get("id", "") or "",
             user_id=data.get("user_id", 0) or 0,
             username=data.get("username", "") or "",
@@ -222,6 +232,8 @@ class Order:
             last_dispatch_at=data.get("last_dispatch_at", "") or "",
             warn_sent=int(data.get("warn_sent", 0) or 0),
         )
+        obj._baseline = obj.to_dict()
+        return obj
 
 
 @dataclass

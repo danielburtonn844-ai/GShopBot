@@ -14,6 +14,8 @@ from .pages_admin import (
     page_admin_broadcast,
     page_admin_finance,
     page_admin_logs,
+    page_admin_recharge_confirm,
+    page_admin_recharges,
 )
 from .pages_stock import (
     page_admin_pool,
@@ -54,6 +56,18 @@ async def _dispatch_supply(
     query, context: ContextTypes.DEFAULT_TYPE, uid: int, data: str, tg_user
 ) -> bool:
     """付费供需：大厅 / 发布向导 / 管理端开关与审核。返回 True 表示该命名空间已处理，False 表示未命中。"""
+    async def _toast(text: str, show_alert: bool = True, **_ignored) -> None:
+        """二次弹 toast（入口处已 answer 过一次，这里容错）。
+
+        与 cb_grab._dispatch_grab 里的同名助手一致：参数名对齐 Telegram Bot API
+        的 `answerCallbackQuery(show_alert=...)`，`**_ignored` 兜住历史调用里的
+        其它别名（早期有调用点传 `alert=` 导致 TypeError，点了没反应）。
+        """
+        try:
+            await query.answer(text=text[:190], show_alert=show_alert)
+        except Exception:
+            pass
+
     # ==================================================================
     # 付费供需（用户端）：大厅 / 我的 / 发布向导
     # sup: 系列已加入顶部状态清理白名单，各分支自行管理 state/payload。
@@ -446,6 +460,27 @@ async def _dispatch_supply(
         return True
 
     # ----- 财务 / 日志 / 备份 / 广播 -----
+    # v2.8.1 补单入口（审计 N-P0-2）：a:rcl 列表 · a:rcq 核对 · a:rcc 执行
+    if data == "a:rcl" or data.startswith("a:rcl:"):
+        page = int(data[6:]) if data.startswith("a:rcl:") and data[6:].isdigit() else 0
+        text, keyboard = page_admin_recharges(page)
+        await send_or_edit(query, text, keyboard)
+        return True
+    if data.startswith("a:rcq:"):
+        text, keyboard = page_admin_recharge_confirm(data[6:])
+        await send_or_edit(query, text, keyboard)
+        return True
+    if data.startswith("a:rcc:"):
+        rid = data[6:]
+        done = service.complete_recharge(rid)
+        if not done:
+            await _toast("❌ 补账失败：单不存在或状态已变（可能已被处理）", show_alert=True)
+        else:
+            audit(uid, "人工补账", f"{rid} · {done.points} 积分 → 用户 {done.user_id}")
+            await _toast(f"✅ 已补 {done.points} 积分给 {done.user_id}", show_alert=True)
+        text, keyboard = page_admin_recharges(0)
+        await send_or_edit(query, text, keyboard)
+        return True
     if data == "a:fin":
         text, keyboard = page_admin_finance()
         await send_or_edit(query, text, keyboard)

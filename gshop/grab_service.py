@@ -1205,24 +1205,21 @@ class GrabService:
             )
             return
         if not current:
-            # 从未配置过接单群：自动设为接单群并打开总开关（零配置）
-            self.db.set_setting("grab_chat_id", cid)
-            self.db.set_setting("grab_enabled", "1")
-            try:
-                await send_html(
-                    self._bot, chat_id,
-                    f"{TG_A_CHEERS} <b>派单机器人已就位</b>\n\n"
-                    f"本群已被自动设为 <b>接单群</b>，新报单会实时推送到这里。\n"
-                    f"接单员请使用各自的专属入群链接进群，入群后静待新单即可。",
-                )
-            except Exception as exc:
-                logger.info("接单群就位公告发送失败：%s", exc)
+            # v2.8.1（审计 N-P1-2）：不再「零配置自动接管」。
+            # 旧实现在这里直接 set_setting(grab_chat_id) + grab_enabled=1，
+            # 任何人建个群把机器人拉进去就接管全站报单与买家备注，零鉴权。
+            # 现在必须由管理员在本条通知上点「设为本群」才生效（走 a:guse:，
+            # 该回调在 handlers_callback 的 a: 前缀权限闸门后面）。
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ 设为本群", callback_data=f"a:guse:{cid}",
+                                     icon_custom_emoji_id=ICON_X_CHECK),
+            ]])
             await self._notify_admins(
-                f"{TG_A_STAR} <b>已自动识别接单群</b>\n\n"
-                f"群名：<b>{escape_html(chat_title)}</b>\n"
-                f"群ID：<code>{cid}</code>\n"
-                f"派单总开关：已自动打开 ✅\n\n"
-                f"如识别有误，到「🥷 接单管理 → ⚙️ 抢单设置」改群ID或关闭总开关即可。"
+                f"{TG_X_BELL} <b>机器人被拉入新群</b>\n\n"
+                f"群名：<b>{escape_html(chat_title)}</b>\n群ID：<code>{cid}</code>\n\n"
+                f"当前尚未配置接单群。确认这是你自己的群，再点下方按钮设为接单群；\n"
+                f"点错会导致全站报单与买家备注推到别人群里。",
+                reply_markup=keyboard,
             )
             return
         # 已配置过别的群：给管理员一键换群按钮
@@ -1238,10 +1235,21 @@ class GrabService:
             reply_markup=keyboard,
         )
 
-    def confirm_grab_chat(self, chat_id: str) -> None:
-        """管理员确认换群：写入群ID并打开总开关。"""
-        self.db.set_setting("grab_chat_id", str(chat_id))
+    def confirm_grab_chat(self, chat_id: str) -> bool:
+        """管理员确认换群：写入群ID并打开总开关。
+
+        v2.8.1（审计 N-P1-2）：加格式硬校验。群 ID 必须是以 "-" 开头的数字串
+        （超级群是 -100xxxxxxxxxx），否则直接拒绝——这是接单群写入口的唯一
+        最后一道闸，伪造回调 / 手改 setting / 未来新入口都绕不过去。
+        返回 True 表示写入成功。
+        """
+        cid = str(chat_id or "").strip()
+        if not (cid.startswith("-") and cid[1:].isdigit()):
+            logger.warning("拒绝非法接单群 ID：%r", chat_id)
+            return False
+        self.db.set_setting("grab_chat_id", cid)
         self.db.set_setting("grab_enabled", "1")
+        return True
 
     # ==================================================================
     # 内部：管理员通知

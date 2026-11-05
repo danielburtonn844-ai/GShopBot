@@ -64,10 +64,19 @@ class UserMixin(ConnAccessMixin):
             return cur.rowcount == 1
 
     def save_user(self, user: User, conn: sqlite3.Connection | None = None) -> None:
-        """保存用户：不存在则 INSERT，存在则只更新真正变化的列。
+        """保存用户：不存在则 INSERT，存在则只更新**本对象改过**的列。
 
-        与 save_order 同一套治理（审计 N-P0-1 / N-P1-3）：任何「读出 User → await
-        → save_user」的调用点，都不会再拿旧快照把别人改过的 points/total_spent 写回去。
+        v2.8.1（审计 N-P0-1 真修）：判定依据是对象自带的 `_baseline`（读库时的
+        原始快照），不是「与数据库当前值比对」。旧实现的基准选错了——
+
+            流程 A 读出 points=100（基线）
+            流程 B 把 points 扣成 60 并落库
+            流程 A 只改了 last_active，回来 save
+            → 旧实现发现 库(60) != 快照(100)，误判成「A 改过 points」，把 100 写回去
+
+        现在只写「当前值 != 基线」的列，本流程没碰过的列一律不进 SQL，
+        期间被谁改过都不影响。资金类增减请走 update_user_points 的 SQL 自增，
+        那条路径连「读-改-写」都不做。
         """
         d = user.to_dict()
         with self._maybe_conn(conn) as c:
@@ -76,17 +85,28 @@ class UserMixin(ConnAccessMixin):
                 cols = ", ".join(d.keys())
                 marks = ", ".join(f":{k}" for k in d)
                 c.execute(f"INSERT INTO users ({cols}) VALUES ({marks})", d)
+                user._baseline = dict(d)
                 return
             old = dict(row)
-            changed = {
-                k: v for k, v in d.items()
-                if k != "user_id" and k in old and old[k] != v
-            }
+            base = getattr(user, "_baseline", None)
+            if base is None:
+                # 直接 new 出来的对象（不是从库里读的），没有基线可比：
+                # 退回「与库比对」，行为与 v2.7.0 一致，不会更差。
+                changed = {
+                    k: v for k, v in d.items()
+                    if k != "user_id" and k in old and old[k] != v
+                }
+            else:
+                changed = {
+                    k: v for k, v in d.items()
+                    if k != "user_id" and k in old and base.get(k) != v
+                }
             if not changed:
                 return
             sets = ", ".join(f"{k} = :{k}" for k in changed)
             changed["user_id"] = user.user_id
             c.execute(f"UPDATE users SET {sets} WHERE user_id = :user_id", changed)
+            user._baseline = dict(d)
 
     def list_users(self, limit: int = 50, offset: int = 0) -> list[User]:
         conn = self._get_conn()

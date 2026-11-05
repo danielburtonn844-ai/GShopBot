@@ -9,9 +9,19 @@ ON CONFLICT(id) DO UPDATE SET 全 28 列的 upsert。任何「读出 Order → a
   - 管理员已回单 → 被派单协程整单回滚，回单内容被清空（内容丢失）
   - 接单员刚抢中 → 被重派协程抹掉，grabber_id 归 0（抢单丢失）
 
-The fix: 落库前先读当前行，只 UPDATE 与内存对象不同的列。内存对象没碰过的列
-永远不可能被写回去，跨 await 持有旧快照就再也不会丢更新。同时提供
-update_order_fields() 做条件更新（CAS），给派单/抢单/退款这些状态机路径用。
+v2.8.1 修正（上一版真的还有洞）：v2.7.0 的「只 UPDATE 与数据库不同的列」把
+判定基准选错了 —— 拿「库里的当前值」跟「内存里的旧快照」比，只要期间别人改过
+这一列，就会被误判成「本流程改过」，于是把旧快照的值写回去。典型：
+
+    流程 A 读出 status=pending
+    流程 B 改成 processing 并落库
+    流程 A 只改了 note，回来 save
+    → 旧实现把 status 写回 pending，B 的处理中状态被覆盖
+
+现在的做法：每个 Order 从库里读出来时记一份 `_baseline` 原始快照，save 时
+只写「当前值 != 基线」的列 —— 也就是本对象真正动过的列。没动过的列不进 SQL，
+期间被谁改过都不会被覆盖。同时提供 update_order_fields() 做条件更新（CAS），
+给派单/抢单/退款这些状态机路径用。
 """
 from __future__ import annotations
 
@@ -88,10 +98,15 @@ class OrderMixin(ConnAccessMixin):
             return cur.rowcount == 1
 
     def save_order(self, order: Order, conn: sqlite3.Connection | None = None) -> None:
-        """保存订单：不存在则 INSERT，存在则**只更新真正变化的列**。
+        """保存订单：不存在则 INSERT，存在则**只更新本对象改过**的列。
 
-        跨 await 拿着旧快照回来 save 时，没被本流程改过的列（管理员回单内容、
-        别人的抢单结果、派单计数……）都不会被覆盖，从根上消灭 N-P0-1 的丢更新。
+        v2.8.1（审计 N-P0-1 真修）：判定依据是对象自带的 `_baseline`（读库时的
+        原始快照），不是「与数据库当前值比对」。旧实现把「库里的新值 != 快照里
+        的旧值」误判成「本流程改过这一列」，于是把旧快照的值写回去——跨 await
+        拿着旧快照回来 save 时照样丢更新，只是触发条件换了。
+
+        现在只写「当前值 != 基线」的列：管理员回单内容、别人的抢单结果、
+        派单计数……只要本流程没动过，就不进 SQL，期间被谁改过都不会被覆盖。
         """
         d = order.to_dict()
         with self._maybe_conn(conn) as c:
@@ -100,17 +115,27 @@ class OrderMixin(ConnAccessMixin):
                 cols = ", ".join(d.keys())
                 marks = ", ".join(f":{k}" for k in d)
                 c.execute(f"INSERT INTO orders ({cols}) VALUES ({marks})", d)
+                order._baseline = dict(d)
                 return
             old = dict(row)
-            changed = {
-                k: v for k, v in d.items()
-                if k != "id" and k in old and old[k] != v
-            }
+            base = getattr(order, "_baseline", None)
+            if base is None:
+                # 直接 new 出来的对象没有基线：退回「与库比对」，行为与 v2.7.0 一致。
+                changed = {
+                    k: v for k, v in d.items()
+                    if k != "id" and k in old and old[k] != v
+                }
+            else:
+                changed = {
+                    k: v for k, v in d.items()
+                    if k != "id" and k in old and base.get(k) != v
+                }
             if not changed:
                 return
             sets = ", ".join(f"{k} = :{k}" for k in changed)
             changed["id"] = order.id
             c.execute(f"UPDATE orders SET {sets} WHERE id = :id", changed)
+            order._baseline = dict(d)
 
     def search_orders(self, keyword: str, limit: int = 15) -> list[Order]:
         """订单搜索（v2.4.0 管理端）：订单号精确/前缀、用户名模糊、商品名模糊。"""

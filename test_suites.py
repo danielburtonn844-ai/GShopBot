@@ -29,6 +29,7 @@ SUITES = [
     "test_bot_full.py",
     "test_extra.py",
     "test_p2_fixes.py",
+    "test_v281_fixes.py",
     "test_p2_9_money.py",
     "test_version_consistency.py",
     "test_coverage_boost.py",

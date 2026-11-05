@@ -67,6 +67,9 @@ jobs:
 
       - name: P2 fix regression tests
         run: python test_p2_fixes.py
+      # v2.8.1: 4 个业务硬伤（补单入口 / 负价兜底 / 拉群接管 / 丢更新）
+      - name: v2.8.1 fix regression tests
+        run: python test_v281_fixes.py
 
       - name: P2-9 Decimal money tests
         run: python test_p2_9_money.py
@@ -95,6 +98,7 @@ jobs:
           coverage run -a --source=gshop,main test_coverage_boost.py
           coverage run -a --source=gshop,main verify_issues.py
           coverage run -a --source=gshop,main test_p2_fixes.py
+          coverage run -a --source=gshop,main test_v281_fixes.py
           coverage run -a --source=gshop,main test_p2_9_money.py
           coverage run -a --source=gshop,main test_cov_deep.py
           coverage run -a --source=gshop,main test_cov_deep2.py
