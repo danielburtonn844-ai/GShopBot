@@ -19,6 +19,11 @@
 # Python：>=3.10（CI 矩阵 3.10 / 3.11 / 3.12）
 # 平台：纯 Python wheel（py3-none-any），无编译依赖，任意平台通用。
 
+# anyio 在 Python < 3.11 上需要 exceptiongroup（3.11+ 有原生 ExceptionGroup，
+# 不再安装）。--require-hashes 要求整棵依赖树全部钉死，缺这一条会让
+# CI 的 3.10 job 在安装依赖这一步直接失败（3.11/3.12 却正常）。
+exceptiongroup==1.3.1; python_version < '3.11' \
+    --hash=sha256:a7a39a3bd276781e98394987d3a5701d0c4edffb633bb7a5144577f82c773598
 anyio==4.16.0 \
     --hash=sha256:c66ae634e0b8228396b801741beb3294326d4b6102f7bba4041c0dfb58c29026
 certifi==2026.10.23 \
