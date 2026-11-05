@@ -7,7 +7,11 @@ from __future__ import annotations
 import logging
 import sqlite3
 from collections.abc import Iterator
+from typing import Any
 
+from ..base import (
+    now_iso,
+)
 from ..schema import (
     User,
 )
@@ -25,25 +29,63 @@ class UserMixin:
                 return User.from_dict(dict(row))
             return None
 
+    USER_COLUMNS = frozenset({
+        "username", "first_name", "last_name", "points", "total_recharge",
+        "total_spent", "is_banned", "invite_code", "invited_by", "created_at", "last_active",
+    })
+
+    def update_user_points(
+        self,
+        user_id: int,
+        delta: int,
+        conn: sqlite3.Connection | None = None,
+        spent_delta: int | None = None,
+        recharge_delta: float | None = None,
+    ) -> bool:
+        """积分增减走 SQL 自增（`points = points + ?`），绝不读改写。
+
+        审计 N-P1-3：原实现是「读 User → 改 → save_user 全字段覆盖」，「每次按
+        按钮都刷新档案」的调用点会把并发期间别人刚扣掉的积分写回去。SQL 自增
+        天然并发安全，两个事务串行执行时各自看到的是最新的余额。
+        """
+        sets = ["points = points + ?", "last_active = ?"]
+        params: list[Any] = [int(delta), now_iso()]
+        if spent_delta is not None:
+            sets.append("total_spent = MAX(0, total_spent + ?)")
+            params.append(int(spent_delta))
+        if recharge_delta is not None:
+            sets.append("total_recharge = MAX(0, total_recharge + ?)")
+            params.append(float(recharge_delta))
+        sql = f"UPDATE users SET {', '.join(sets)} WHERE user_id = ?"
+        params.append(int(user_id))
+        with self._maybe_conn(conn) as c:
+            cur = c.execute(sql, params)
+            return cur.rowcount == 1
+
     def save_user(self, user: User, conn: sqlite3.Connection | None = None) -> None:
+        """保存用户：不存在则 INSERT，存在则只更新真正变化的列。
+
+        与 save_order 同一套治理（审计 N-P0-1 / N-P1-3）：任何「读出 User → await
+        → save_user」的调用点，都不会再拿旧快照把别人改过的 points/total_spent 写回去。
+        """
         d = user.to_dict()
         with self._maybe_conn(conn) as c:
-            c.execute("""
-                INSERT INTO users (user_id, username, first_name, last_name, points, total_recharge, total_spent, is_banned, invite_code, invited_by, created_at, last_active)
-                VALUES (:user_id, :username, :first_name, :last_name, :points, :total_recharge, :total_spent, :is_banned, :invite_code, :invited_by, :created_at, :last_active)
-                ON CONFLICT(user_id) DO UPDATE SET
-                    username=excluded.username,
-                    first_name=excluded.first_name,
-                    last_name=excluded.last_name,
-                    points=excluded.points,
-                    total_recharge=excluded.total_recharge,
-                    total_spent=excluded.total_spent,
-                    is_banned=excluded.is_banned,
-                    invite_code=excluded.invite_code,
-                    invited_by=excluded.invited_by,
-                    created_at=excluded.created_at,
-                    last_active=excluded.last_active
-            """, d)
+            row = c.execute("SELECT * FROM users WHERE user_id = ?", (user.user_id,)).fetchone()
+            if row is None:
+                cols = ", ".join(d.keys())
+                marks = ", ".join(f":{k}" for k in d)
+                c.execute(f"INSERT INTO users ({cols}) VALUES ({marks})", d)
+                return
+            old = dict(row)
+            changed = {
+                k: v for k, v in d.items()
+                if k != "user_id" and k in old and old[k] != v
+            }
+            if not changed:
+                return
+            sets = ", ".join(f"{k} = :{k}" for k in changed)
+            changed["user_id"] = user.user_id
+            c.execute(f"UPDATE users SET {sets} WHERE user_id = :user_id", changed)
 
     def list_users(self, limit: int = 50, offset: int = 0) -> list[User]:
         conn = self._get_conn()

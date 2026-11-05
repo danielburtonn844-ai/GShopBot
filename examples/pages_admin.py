@@ -207,28 +207,32 @@ def page_admin_pcats() -> tuple[str, InlineKeyboardMarkup]:
 # ==================================================================
 
 def page_admin_order(filter_status: str = "all") -> tuple[str, InlineKeyboardMarkup]:
-    orders = db.list_orders(limit=200)
-    if filter_status != "all":
-        orders = [o for o in orders if o.status == filter_status]
+    """订单管理列表（v2.7.0 审计 P1-6）：筛选与计数全部下推 SQL。
 
+    旧实现先 list_orders(limit=200) 再在 Python 里按状态过滤：
+    ① 非 all 状态下「共 N 条」永远是被 LIMIT 200 截断后的数量；
+    ② 超过 200 条的历史订单在筛选里直接消失；
+    ③ 每次打开页面都要把 200 行整表读进内存再丢弃。
+    现在改为 status 下推 SQL + count_orders 精确计数。
+    """
+    status_filter = None if filter_status == "all" else filter_status
+    orders = db.list_orders(status=status_filter, limit=15)
     fname = {"all": "全部", "pending": "待处理", "processing": "处理中",
              "completed": "已完成", "refunded": "已退款"}.get(filter_status, "全部")
-    lines = [f"<b>📋 订单管理</b>（{fname}，共 {len(orders)} 条）", ""]
+    total = db.count_orders(status_filter)
+    lines = [f"<b>📋 订单管理</b>（{fname}，共 {total} 条）", ""]
     buttons = []
     if not orders:
         lines.append("暂无订单")
     else:
-        for o in orders[:15]:
+        for o in orders:
             pool_mark = "📦 " if getattr(o, "stock_item_id", 0) else ""
             lines.append(
                 f"{order_status_text(o.status)} {pool_mark}<code>{o.id}</code> {h(o.product_name)} @{h(o.username or '-')}"
             )
             buttons.append([(f"📄 {o.id}", f"a:od:{o.id}")])
-        if len(orders) > 15:
-            # 总数要从库里数，不能用 len(orders)：列表本身被 LIMIT 200 截断，
-            # 超过 200 条时会显示「共 200 条」，数字是错的
-            total = db.count_orders(None if filter_status == "all" else filter_status)
-            lines.append(f"\n<i>仅显示最近 15 条，共 {total} 条</i>")
+        if total > len(orders):
+            lines.append(f"\n<i>仅显示最近 {len(orders)} 条，共 {total} 条</i>")
 
     buttons.append([("⏳ 待处理", "a:of:pending"), ("🔄 处理中", "a:of:processing")])
     buttons.append([("✅ 已完成", "a:of:completed"), ("💰 已退款", "a:of:refunded")])

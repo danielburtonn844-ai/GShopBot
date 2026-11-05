@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 
 from telegram import Update
 from telegram.ext import ContextTypes
@@ -44,6 +45,54 @@ logger = logging.getLogger(__name__)
 
 # 图册聚合防抖秒数：同一条多图消息会拆成多条 update 陆续到达，等最后一张到了再入库
 ALBUM_DEBOUNCE = 1.0
+
+# v2.7.0（审计 N-P0-4）：商品可编辑字段白名单 + 数值区间/类型约束。
+# 旧实现把 state 里的字段名直接 setattr 到 Product 上，理论上可写入任意属性；
+# 数值字段也只做 int() 转换，负数/0 价格、超限库存都能落库。
+# 这里把「允许改哪些字段」和「每个数值字段的合法区间」全部收在一处。
+_EDITABLE_PRODUCT_FIELDS: dict[str, tuple[str, int, int]] = {
+    # 字段名 -> (类型, 最小值, 最大值)
+    "name": ("str", 1, 64),
+    "description": ("str", 0, 2000),
+    "category": ("str", 0, 32),
+    "auto_delivery": ("str", 0, 4000),
+    "points": ("int", 1, 10_000_000),
+    "stock": ("int", -1, 10_000_000),
+    "limit_per_user": ("int", 0, 100_000),
+}
+
+
+def _parse_product_field(field_name: str, text: str) -> tuple[object, str | None]:
+    """校验并转换一个商品字段值。返回 (值, 错误提示)，错误提示为 None 表示合法。"""
+    meta = _EDITABLE_PRODUCT_FIELDS.get(field_name)
+    if not meta:
+        return None, "❌ 该字段不可编辑"
+    kind, lo, hi = meta
+    raw = (text or "").strip()
+    if kind == "str":
+        if len(raw) < lo:
+            return None, "❌ 内容不能为空"
+        if len(raw) > hi:
+            return None, f"❌ 内容过长（最多 {hi} 字）"
+        return raw, None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None, "❌ 请输入整数"
+    if value < lo or value > hi:
+        return None, f"❌ 取值范围 {lo} ~ {hi}"
+    return value, None
+
+
+def _parse_finite_float(text: str) -> float | None:
+    """解析有限浮点数：拒绝 nan / inf / 1e400 这类会让金额校验失效的输入。"""
+    try:
+        value = float((text or "").strip())
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(value):
+        return None
+    return value
 
 
 async def _album_commit_later(bot, chat_id: int, user_data: dict, pid: str, mgid: str, version: int, admin_id: int) -> None:
@@ -114,9 +163,8 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     # ---------- 自定义充值金额 ----------
     if state == "rc_custom":
         clear_state(context)
-        try:
-            amount = float(text)
-        except ValueError:
+        amount = _parse_finite_float(text)
+        if amount is None:
             await message.reply_text("❌ 请输入有效数字", reply_markup=kb([[("⬅️ 返回", "m:recharge")]]))
             return
         # 限额统一走业务层校验（最低/最高都拦）
@@ -341,8 +389,8 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         raw = text.strip()
         if kind == "num":
             try:
-                val = float(raw)
-                if val < 0:
+                val = _parse_finite_float(raw)
+                if val is None or val < 0:
                     raise ValueError
                 # 秒/分钟/次数用整数，小时与比例允许小数
                 val = int(val) if key not in ("grab_timeout_hours", "grab_freeze_hours") else val
@@ -556,12 +604,9 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     if state == "padd_points":
-        try:
-            points = int(text)
-            if points <= 0:
-                raise ValueError
-        except ValueError:
-            await message.reply_text("❌ 请输入正整数", reply_markup=kb([[("❌ 取消", "a:prod")]]))
+        points, err = _parse_product_field("points", text)
+        if err:
+            await message.reply_text(err, reply_markup=kb([[("❌ 取消", "a:prod")]]))
             return
         context.user_data["payload"]["points"] = points
         context.user_data["state"] = "padd_kind"
@@ -575,10 +620,11 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     if state == "padd_stock":
-        try:
-            stock_val = int(text)
-        except ValueError:
-            await message.reply_text("❌ 请输入整数（-1 表示无限）", reply_markup=kb([[("❌ 取消", "a:prod")]]))
+        stock_val, err = _parse_product_field("stock", text)
+        if err:
+            await message.reply_text(
+                "❌ 请输入整数（-1 表示无限）", reply_markup=kb([[("❌ 取消", "a:prod")]])
+            )
             return
         context.user_data["payload"]["stock"] = stock_val
         context.user_data["state"] = "padd_limit"
@@ -589,11 +635,8 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     if state == "padd_limit":
-        try:
-            limit = int(text)
-            if limit < 0:
-                raise ValueError
-        except ValueError:
+        limit, err = _parse_product_field("limit_per_user", text)
+        if err:
             await message.reply_text("❌ 请输入非负整数", reply_markup=kb([[("❌ 取消", "a:prod")]]))
             return
         context.user_data["payload"]["limit_per_user"] = limit
@@ -650,17 +693,13 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         if not p:
             await message.reply_text("❌ 商品不存在", reply_markup=kb([[("⬅️ 返回", "a:prod")]]))
             return
-        if field_name in ("points", "stock", "limit_per_user"):
-            try:
-                value = int(text)
-            except ValueError:
-                await message.reply_text("❌ 请输入整数", reply_markup=kb([[("❌ 取消", f"a:pedit:{pid}")]]))
-                return
-            setattr(p, field_name, value)
-        else:
-            setattr(p, field_name, text)
-            if field_name == "description" and photo_id:
-                p.photo_file_id = photo_id
+        value, err = _parse_product_field(field_name, text)
+        if err:
+            await message.reply_text(err, reply_markup=kb([[("❌ 取消", f"a:pedit:{pid}")]]))
+            return
+        setattr(p, field_name, value)
+        if field_name == "description" and photo_id:
+            p.photo_file_id = photo_id
         db.save_product(p)
         audit(uid, "改商品字段", f"{p.name}.{field_name}")
         t, keyboard = page_admin_pedit(pid)
@@ -696,10 +735,12 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         clear_state(context)
         try:
             amount = int(text)
-            if amount <= 0:
+            if amount <= 0 or amount > 100_000_000:
                 raise ValueError
         except ValueError:
-            await message.reply_text("❌ 请输入正整数", reply_markup=kb([[("⬅️ 返回", f"a:ud:{target_uid}")]]))
+            await message.reply_text(
+                "❌ 请输入正整数（上限 1 亿）", reply_markup=kb([[("⬅️ 返回", f"a:ud:{target_uid}")]])
+            )
             return
         delta = amount if action == "uadd" else -amount
         reason = "管理员加分" if action == "uadd" else "管理员减分"
@@ -797,11 +838,8 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     # ---------- 最低充值金额 ----------
     if state == "smin":
         clear_state(context)
-        try:
-            min_amount = float(text)
-            if min_amount <= 0:
-                raise ValueError
-        except ValueError:
+        min_amount = _parse_finite_float(text)
+        if min_amount is None or min_amount <= 0:
             await message.reply_text("❌ 请输入有效数字", reply_markup=kb([[("⬅️ 返回", "a:set")]]))
             return
         db.update_settings(min_recharge_usdt=min_amount)
@@ -815,8 +853,10 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         clear_state(context)
         parts = text.replace("，", " ").split()
         try:
-            min_v = float(parts[0])
-            max_v = float(parts[1]) if len(parts) > 1 else 0.0
+            min_v = _parse_finite_float(parts[0])
+            max_v = _parse_finite_float(parts[1]) if len(parts) > 1 else 0.0
+            if min_v is None or max_v is None:
+                raise ValueError
             if min_v <= 0 or max_v < 0 or (max_v > 0 and max_v < min_v):
                 raise ValueError
         except (ValueError, IndexError):

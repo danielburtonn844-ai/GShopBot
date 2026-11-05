@@ -1,5 +1,93 @@
 # CHANGELOG — G Shop Bot
 
+## v2.7.0 · 2026-11-05
+
+> 本版本以两份审计报告（完整审计 69 项缺陷 + 二次深挖增量）为输入，集中修复订单状态机、
+> 库存池发货鉴权、佣金结算与充值过期四类缺陷。全部改动均附带回归验证，自检从 7207 项增至 7209 项。
+
+### 安全（P0）
+- **订单详情不再泄露未发货内容**（审计 P0-2）。旧实现 `page_order_detail` 对任意状态都渲染
+  `reply_content`，库存池订单还会直接展开 `content_text`，未发货/待处理单的内容可以被下单人
+  反复查看。现在只在 `status == 'completed'` 时下发正文，其余状态显示「发货后可见」/「内容已锁定」。
+- **库存池发货三重校验**（审计 P0-1）。`StockService.deliver_item` 新增 `order_id` 参数，并校验
+  ① 库存件的 `order_id` 必须等于传入订单号；② 库存件的 `buyer_id` 必须等于收货用户；
+  ③ 订单必须是 `completed`。任一不符直接拒绝，堵住「拿到别人的件编号就能提货」的越权路径。
+- **抢已终态订单被拦截**（审计 P0-3）。`try_grab` 新增 `status in ('pending','processing')` 前置
+  校验，`grab_order_atomic` 的 UPDATE 也加了同样条件；已完成/已退款的单不会再被抢中。
+- **不能抢自己下的单**。`try_grab` 新增 `order.user_id == user_id` 拒绝分支。
+- **完成/放弃必须判状态**（审计 P0-4）。`giveup` 加状态校验 + CAS 释放，`complete_by_grabber`
+  改为 CAS 迁移状态，并发下不会把已终态的单再改一次。
+- **商品字段白名单**（审计 N-P0-4）。`handlers_message` 的 `pedit:` 状态机不再把用户输入直接
+  `setattr` 到 `Product`，改为查 `_EDITABLE_PRODUCT_FIELDS`（7 个字段，各带类型与区间）：
+  价格 1~1000 万、库存 -1~1000 万、限购 0~10 万、名称 1~64 字、介绍 0~2000 字。
+- **数值输入拒绝 nan/inf**。新增 `_parse_finite_float`，`rc_custom` / `gset:` / `smin` /
+  `pay_limit` 四处金额入口全部改走它，`float('nan')`、`float('inf')`、`1e400` 不再能穿透
+  限额校验（nan 参与比较恒为 False，旧实现会让「最低充值」校验整体失效）。
+
+### 资金与账务（P0）
+- **佣金一单只结一次**（审计 N-P0-6）。新增 `_settle_commission_locked`，先查
+  `get_commission_by_order` 再落账；`complete_order` 与 `complete_by_grabber` 共用同一入口，
+  两条回单路径不会再各结一次。配合 `core.py` 新建的部分唯一索引
+  `uniq_gc_order_active`（`WHERE status IN ('frozen','released')`），数据库层面兜底。
+- **退款冲销佣金**。新增 `_reverse_commission_locked`：`frozen` 状态扣 `balance_frozen`，
+  `released` 状态扣 `balance_available`（允许为负，记负债），CAS 用 `expect=cm.status`。
+- **佣金溢出防护**（审计 N-P0-5）。新增 `_calc_commission`：`Decimal` + `ROUND_HALF_UP`，
+  `is_finite` 校验，百分比 100 封顶，正单至少 1 分。`_safe_commission` 在已锁定值上再复核
+  `min(locked, points)`，历史脏数据不会算出超过订单金额的佣金。
+- **冷钱包充值不再被 2 小时判死**（审计 N-P0-2）。`check_all_pending_recharges` 对 `chain` 非空的
+  单直接跳过过期逻辑；改由 `check_chain_recharges` 按 `CHAIN_GRACE_HOURS = 72` 处理，超期置
+  新增状态 `expired`（不是 `failed`），`complete_recharge` 与 `check_recharge_status(allow_failed=True)`
+  都接受 `expired` 补账。旧行为下「用户 3 小时后才从交易所提币」会钱进冷钱包、单已 failed、永不入账。
+
+### 并发与一致性（P1）
+- **订单号不再撞号**（审计 P1-3）。新增 `order_seq(date PRIMARY KEY, seq, updated_at)` 表 +
+  `next_order_seq`，替代 `COUNT(*)+1`。旧实现在并发下单、或订单被删除/归档后会生成重复单号。
+- **积分扣减改 SQL 自增**（审计 N-P1-3）。新增 `update_user_points(user_id, delta, spent_delta=...)`，
+  走 `UPDATE users SET points = points + ?, total_spent = MAX(0, total_spent + ?)`；`create_order`
+  不再读-改-写内存快照，丢更新（lost update）消除。
+- **`save_order` / `save_user` 差量更新**。新增 `ORDER_COLUMNS` 白名单，只 UPDATE 真正变化的列，
+  并发写不同字段时不再互相覆盖。
+- **`update_order_fields` CAS 契约**。新增条件更新方法（`where=` + `where_params=`），返回 `False`
+  时调用方必须放弃本次操作。`complete_order` / `refund_order` / `mark_dispatched` / `giveup` /
+  `complete_by_grabber` 全部改用 CAS。
+- **派单防丢更新**。新增 `mark_dispatched`（`WHERE grab_status NOT IN ('waiting','grabbed') AND
+  status IN ('pending','processing')`），`dispatch_order` 发送卡片后用它落库，失败则把卡片改成
+  「此单已失效」。旧实现 `order.grab_status = ...; save_order(order)` 会覆盖抢单人的写入。
+- **退款清理全部派单字段**。`refund_order` CAS 退款后一并清空 `grab_status / grabber_id /
+  grabber_name / commission / grab_at / deadline / warn_sent`，退款单不会再挂在接单群里。
+
+### 库存池
+- **新增 `delivered` 终态**。`mark_stock_item_delivered(item_id, order_id, buyer_id)` 做 sold →
+  delivered 的 CAS，保留「这件的凭证属于哪一单」的可追溯性；`revoke_stock_item` 用于退款收不回
+  的件（置 `revoked` + 清 `order_id`/`buyer_id`，永不再售）。
+- **`sold` 语义扩展**。`list_stock_items` / `count_stock_items` / `clear_sold_stock_items` /
+  `stock_pool_stats` 在 `status='sold'` 时按 `status IN ('sold','delivered')` 查询，历史调用点
+  （管理端留凭证、清已售、财务统计）无需改动即可看到已交付件。
+- **`release_stock_item` 加 `AND status='sold'` 守卫**，不会把已交付/已撤销的件退回可售池。
+- **`get_stock_item_for_order(order_id)`** 新增，按订单反查库存件。
+
+### 性能
+- **订单列表下推 SQL**（审计 P1-6）。`page_admin_order` 从「`list_orders(limit=200)` + Python 过滤」
+  改为 `list_orders(status=..., limit=15)` + `count_orders(status)`。旧实现在非 all 状态下「共 N 条」
+  永远是被截断后的数字，超过 200 条的历史订单在筛选里直接消失。
+- **`list_orders` 新增筛选参数**：`grab_status` / `created_after` / `created_before`，全部下推 SQL。
+- **`count_orders_by_status()`** 一条 `GROUP BY` 出全部状态计数。
+- **`orders` 热索引**：`(status, created_at)`、`(user_id, status)`、`(grab_status, deadline)`；
+  `grab_commissions(order_id)`、`stock_items(order_id)` 辅助索引。
+
+### 界面
+- 充值记录状态标记新增 `⌛ expired`（与 `❌ failed` 区分），用户能看出「超时待核对」而不是「失败」。
+
+### 自检
+- `test_bot_full.py` 从 7207 项增至 **7209 项**：
+  - 原「冷钱包单过期清理」改为「冷钱包单不因超时被置失败」（行为变更的显式断言）；
+  - 新增「冷钱包超宽限期转 expired」；
+  - 新增「expired 单可人工补账」。
+- 回归结果：`test_bot_full.py` 7209 项 0 失败、`test_extra.py` 85 项 0 失败、
+  `test_coverage_boost.py` 75 项 0 失败、`verify_issues.py` 47 项 0 失败、`ruff` 全通过、
+  `compileall` 通过。
+
+
 ## v2.6.7 · 2026-10-22
 
 ### 新增

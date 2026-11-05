@@ -396,8 +396,37 @@ class GrabMixin:
             cur = c.execute(
                 "UPDATE orders SET grab_status = 'grabbed', grabber_id = ?, grabber_name = ?,"
                 " commission = ?, grab_at = ?, deadline = ?"
-                " WHERE id = ? AND grab_status = 'waiting'",
+                " WHERE id = ? AND grab_status = 'waiting'"
+                " AND status IN ('pending', 'processing')",
                 (grabber_id, grabber_name, commission, grab_at, deadline, order_id),
+            )
+            return cur.rowcount == 1
+
+    def mark_dispatched(
+        self,
+        order_id: str,
+        commission: int,
+        dispatch_chat: str,
+        dispatch_msg: int,
+        dispatched_at: str,
+        conn: sqlite3.Connection | None = None,
+    ) -> bool:
+        """派单成功后的条件写入（v2.7.0，审计 N-P0-1）。
+
+        原实现是「await 发卡片 → 改内存对象 → save_order」：await 期间管理员可能已经
+        回单/退款，回来再把 grab_status 写成 waiting，于是已完成的单又变成待抢，
+        被人抢走并重复回单（实测输出 grab_status='' grabber_id=0）。
+        这里把写入改成单条 CAS：只有订单仍未被处理、且不处于 waiting/grabbed 时
+        才落库；返回 False 说明卡片发出后订单状态已变，调用方必须放弃本次派单。
+        """
+        with self._maybe_conn(conn) as c:
+            cur = c.execute(
+                "UPDATE orders SET grab_status = 'waiting', commission = ?,"
+                " dispatch_chat = ?, dispatch_msg = ?, dispatch_count = dispatch_count + 1,"
+                " last_dispatch_at = ?, warn_sent = 0"
+                " WHERE id = ? AND grab_status NOT IN ('waiting', 'grabbed')"
+                " AND status IN ('pending', 'processing')",
+                (commission, dispatch_chat, dispatch_msg, dispatched_at, order_id),
             )
             return cur.rowcount == 1
 
@@ -455,6 +484,7 @@ class GrabMixin:
         try:
             rows = conn.execute(
                 "SELECT * FROM orders WHERE grab_status = 'grabbed' AND deadline != '' AND deadline <= ?"
+                " AND status IN ('pending', 'processing')"
                 " ORDER BY deadline ASC LIMIT ?",
                 (now, limit),
             ).fetchall()

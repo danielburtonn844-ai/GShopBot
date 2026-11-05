@@ -1340,8 +1340,33 @@ async def run():
     service.check_recharge_status = _fake_chk  # 隔离平台单的真实网络请求
     await service.check_all_pending_recharges()
     service.check_recharge_status = orig_chk
-    check("冷钱包单过期清理", db.get_recharge(rc_old.id).status == "failed")
+    # v2.7.0（审计 N-P0-2）：冷钱包单不再由 check_all_pending_recharges 置 failed。
+    # 旧行为会让「用户 3 小时后才从交易所提币」的已付款单永远无法自动入账。
+    # 新语义：冷钱包单留在 pending 继续参与链上匹配，超宽限期（72h）才转 expired。
+    check("冷钱包单不因超时被置失败", db.get_recharge(rc_old.id).status == "pending")
     check("链上订单状态查询走空", await service.check_recharge_status(rc_tron.id) is False)
+
+    # --- 冷钱包单超宽限期转 expired（保留人工补单入口，与 failed 区分）---
+    orig_tf2 = _ss_mod.fetch_tron_usdt_incoming
+    orig_nf2 = _ss_mod.fetch_ton_usdt_incoming
+    async def _empty_tron(address, api_key="", **kw):
+        return []
+    async def _empty_ton(address, api_key="", **kw):
+        return []
+    _ss_mod.fetch_tron_usdt_incoming = _empty_tron
+    _ss_mod.fetch_ton_usdt_incoming = _empty_ton
+    ancient_ts = (_dtx.now(LOCAL_TZ) - _td(hours=100)).isoformat()
+    conn = db._get_conn()
+    try:
+        conn.execute("UPDATE recharges SET created_at = ? WHERE id = ?", (ancient_ts, rc_old.id))
+        conn.commit()
+    finally:
+        conn.close()
+    await service.check_chain_recharges()
+    _ss_mod.fetch_tron_usdt_incoming = orig_tf2
+    _ss_mod.fetch_ton_usdt_incoming = orig_nf2
+    check("冷钱包超宽限期转 expired", db.get_recharge(rc_old.id).status == "expired")
+    check("expired 单可人工补账", service.complete_recharge(rc_old.id) is not None)
 
     # ========== 19. 抢单派单（v2.6.0） ==========
     print("\n=== 19. 抢单派单 ===")

@@ -211,7 +211,7 @@ async def _dispatch_user(
         item_id = getattr(order, "stock_item_id", 0)
         if item_id:
             item = db.get_stock_item(item_id)
-            delivered = await stock.deliver_item(uid, item) if item else False
+            delivered = await stock.deliver_item(uid, item, order.id) if item else False
             if not delivered:
                 fresh = db.get_order(order.id)
                 if fresh:
@@ -260,14 +260,19 @@ async def _dispatch_user(
     if data.startswith("redeliver:"):
         oid = data[10:]
         o = db.get_order(oid)
-        item = db.get_stock_item(o.stock_item_id) if o and o.user_id == uid and o.stock_item_id else None
+        item = None
         if not o or o.user_id != uid:
             text = "❌ 订单不存在"
-        elif not item:
-            text = "❌ 购得内容记录已清理，无法重发"
         else:
-            ok = await stock.deliver_item(uid, item)
-            text = f"✅ 编号 #{item.id} 已重新发送，请查收私信" if ok else "❌ 发送失败，请稍后重试"
+            item = db.get_stock_item(o.stock_item_id) if o.stock_item_id else None
+            if not item:
+                text = "❌ 购得内容记录已清理，无法重发"
+            elif o.status != "completed":
+                # v2.7.0（审计 P0-1）：只有已完成订单才能重发，退款单不能继续取内容
+                text = "❌ 订单不是已完成状态，无法重发"
+            else:
+                ok = await stock.deliver_item(uid, item, o.id)
+                text = f"✅ 编号 #{item.id} 已重新发送，请查收私信" if ok else "❌ 发送失败，请稍后重试"
         t2, k2 = page_order_detail(uid, oid)
         await send_or_edit(query, text + "\n\n" + t2, k2)
         return True

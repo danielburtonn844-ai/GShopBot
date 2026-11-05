@@ -144,10 +144,35 @@ class StockService:
     # 售卖：发货 + 失败回滚
     # ==================================================================
 
-    async def deliver_item(self, user_id: int, item: StockItem) -> bool:
-        """把一件货送达买家私信。返回是否成功（失败由调用方决定回滚）。"""
+    async def deliver_item(
+        self, user_id: int, item: StockItem, order_id: str = ""
+    ) -> bool:
+        """把一件货送达买家私信。返回是否成功（失败由调用方决定回滚）。
+
+        v2.7.0（审计 P0-1）：新增三重归属校验 + 送达后置 delivered。
+        原实现只认 item_id，任何拿到编号的路径都能把货再发一次：
+        1. item.order_id 必须是本单（防把 A 单的货发到 B 单）；
+        2. item.buyer_id 必须是本人（防越权取别人的货）；
+        3. 成功送达后把件置 delivered，退款时据此判断「内容已离开平台」，不再回池。
+        传 order_id 为空时跳过前两项（管理端预览场景），但仍会做送达标记。
+        """
         if not self._bot:
             return False
+        if order_id:
+            if item.order_id != order_id:
+                logger.warning(
+                    "拒绝发货：件 #%s 属于订单 %s，不是 %s", item.id, item.order_id, order_id
+                )
+                return False
+            if item.buyer_id != user_id:
+                logger.warning(
+                    "拒绝发货：件 #%s 的买家是 %s，请求者是 %s", item.id, item.buyer_id, user_id
+                )
+                return False
+            order = self.db.get_order(order_id)
+            if not order or order.status != "completed":
+                logger.warning("拒绝发货：订单 %s 不是已完成状态", order_id)
+                return False
         header = f"📦 您的专属内容（编号 #{item.id}）"
         try:
             if item.content_type == "text":
@@ -178,10 +203,13 @@ class StockService:
                 await self._bot.send_media_group(chat_id=user_id, media=media)
             else:
                 return False
-            return True
         except Exception as exc:
             logger.warning("库存池发货失败 item=%s user=%s: %s", item.id, user_id, exc)
             return False
+        # 送达成功：sold → delivered。一旦 delivered，退款时不再把货放回池子。
+        if item.order_id:
+            self.db.mark_stock_item_delivered(item.id, item.order_id, item.buyer_id)
+        return True
 
     async def rollback_sale(self, order: Order, reason: str = "发货失败") -> None:
         """售出后送达失败的补偿：退积分 + 货回池 + 订单置退款 + 通知买家与管理员。"""

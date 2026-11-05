@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta
-from decimal import ROUND_HALF_UP, Decimal
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
@@ -27,7 +27,6 @@ from .models import (
     LOCAL_TZ,
     GrabAppeal,
     Grabber,
-    GrabCommission,
     Order,
     Withdrawal,
     escape_html,
@@ -142,7 +141,44 @@ class GrabService:
             pct = int(self.settings.get("grab_commission_pct", 20) or 0)
         if pct <= 0:
             return 0
-        return max(0, int(order.points * pct / 100))
+        return self._calc_commission(order.points, pct)
+
+    @staticmethod
+    def _calc_commission(points: int, pct: float) -> int:
+        """佣金计算（v2.7.0，审计 N-P0-5）：全程 Decimal + 上限封顶 + 非有限值拒绝。
+
+        原实现 `int(order.points * pct / 100)` 有三个坑：
+        1. float 乘法在 pct 为 inf/nan 时会算出 inf/nan，int() 直接抛 ValueError 或
+           产生天文数字，穿透到 timedelta(hours=...) 时把进程炸掉；
+        2. 比例没有上限，把 grab_commission_pct 配成 100000 就能把佣金刷到天上；
+        3. 正佣金单可能算出 0，接单员白干。
+        这里把比例夹到 [0, 100]、非有限值直接按 0 处理，正单佣金至少 1 分。
+        """
+        try:
+            pct_d = Decimal(str(pct))
+            if not pct_d.is_finite():
+                return 0
+        except (InvalidOperation, ValueError):
+            return 0
+        if pct_d <= 0:
+            return 0
+        if pct_d > 100:
+            pct_d = Decimal(100)
+        pts = max(0, int(points or 0))
+        amount = (Decimal(pts) * pct_d / Decimal(100)).quantize(
+            Decimal(1), rounding=ROUND_HALF_UP
+        )
+        value = int(amount)
+        if value <= 0 and pts > 0 and pct_d > 0:
+            return 1  # 正单佣金至少 1，避免「抢了等于白干」
+        return max(0, value)
+
+    def _safe_commission(self, order: Order) -> int:
+        """抢单时取佣金：已锁定值优先，但要复核（防止旧数据里的脏值）。"""
+        locked = int(order.commission or 0)
+        if locked > 0:
+            return min(locked, max(0, int(order.points or 0)))
+        return self.commission_for(order)
 
     # ==================================================================
     # 接单员档案
@@ -232,6 +268,8 @@ class GrabService:
             return False
         if order.grab_status in ("waiting", "grabbed"):
             return False  # 防重复派单
+        if order.status not in ("pending", "processing"):
+            return False  # 已终态的单不再派，防已回单/已退款的单被重新派出去
         commission = self.commission_for(order)
         try:
             msg = await send_html(
@@ -248,23 +286,46 @@ class GrabService:
                 f"修好后可到「派单中心 → 超时/重派」重发，或人工回单。"
             )
             return False
-        order.grab_status = "waiting"
-        order.commission = commission
-        order.dispatch_chat = str(self.chat_id())
-        order.dispatch_msg = msg.message_id
-        order.dispatch_count = (order.dispatch_count or 0) + 1
-        order.last_dispatch_at = now_iso()
-        order.warn_sent = 0
-        self.db.save_order(order)
+        # 发卡片是异步的，回来必须重新对齐数据库，不能信内存里的旧快照。
+        # 单条 CAS：只有订单仍未被处理、且不处于 waiting/grabbed 时才落库。
+        ok = self.db.mark_dispatched(
+            order.id, commission, str(self.chat_id()), msg.message_id, now_iso()
+        )
+        if not ok:
+            # 卡片已发出但订单已被处理（回单/退款/被别人抢走），把这张卡改成失效提示
+            await self._edit_dispatch_card(
+                order,
+                f"{TG_X_WARN} <b>此单已失效</b>\n\n"
+                f"订单：<code>#{order.id}</code>\n"
+                f"<i>派单期间订单状态已变更，请忽略本卡片。</i>",
+                keyboard=None,
+            )
+            return False
+        fresh = self.db.get_order(order.id)
+        if fresh:
+            order.grab_status = fresh.grab_status
+            order.commission = fresh.commission
+            order.dispatch_chat = fresh.dispatch_chat
+            order.dispatch_msg = fresh.dispatch_msg
+            order.dispatch_count = fresh.dispatch_count
+            order.last_dispatch_at = fresh.last_dispatch_at
+            order.warn_sent = fresh.warn_sent
         return True
 
     async def redispatch_order(self, order: Order, reason: str = "") -> bool:
         """重派：超时/放弃释放后再次发卡片。超过最大次数则交还管理员人工处理。"""
         max_n = int(self.settings.get("grab_max_dispatch", 3) or 3)
-        if (order.dispatch_count or 0) >= max_n:
-            # 派单流程关闭，订单回到管理员人工回单池
-            order.grab_status = ""
-            self.db.save_order(order)
+        fresh = self.db.get_order(order.id) or order
+        if fresh.status not in ("pending", "processing"):
+            return False  # 已回单/已退款，不再重派
+        if (fresh.dispatch_count or 0) >= max_n:
+            # 派单流程关闭，订单回到管理员人工回单池。
+            # 用 CAS 只清 grab_status，不整体 save_order（否则会抹掉别人刚写的字段）。
+            self.db.update_order_fields(
+                fresh.id,
+                where="status IN ('pending', 'processing') AND grab_status NOT IN ('grabbed')",
+                grab_status="",
+            )
             await self._notify_admins(
                 f"{TG_X_WARN} <b>派单已达最大重派次数</b>\n\n"
                 f"订单：<code>#{order.id}</code>（{escape_html(order.product_name)}）\n"
@@ -273,13 +334,27 @@ class GrabService:
             )
             return False
         # 重新发一张卡片（老卡片留着做记录，内容为「已释放」由调用方更新）
-        return await self.dispatch_order_new_card(order)
+        return await self.dispatch_order_new_card(fresh)
 
     async def dispatch_order_new_card(self, order: Order) -> bool:
-        """重派用：清掉旧卡片绑定再发新卡（dispatch_order 里有 waiting 防重，先洗状态）。"""
-        order.grab_status = ""
-        self.db.save_order(order)
-        return await self.dispatch_order(order)
+        """重派用：清掉旧卡片绑定再发新卡。
+
+        v2.7.0（审计 N-P0-1 后果 B）：原实现先 `grab_status = ""` 再 `save_order`，
+        把抢中结果无条件抹掉（实测：重派后 grab_status="" grabber_id=0），而且
+        save_order 会把整份旧快照写回。现在改成单条 CAS 同时「释放 + 允许重派」，
+        且只在订单未被抢中、未被处理时才放行。
+        """
+        released = self.db.update_order_fields(
+            order.id,
+            where="status IN ('pending', 'processing') AND grab_status NOT IN ('grabbed')",
+            grab_status="",
+        )
+        if not released:
+            return False  # 已被抢中或已终态，重派无意义
+        fresh = self.db.get_order(order.id)
+        if not fresh:
+            return False
+        return await self.dispatch_order(fresh)
 
     async def _edit_dispatch_card(self, order: Order, text: str, keyboard: InlineKeyboardMarkup | None = None) -> None:
         """更新群内派单卡片（抢中/释放/超时）。失败只记日志不影响主流程。"""
@@ -324,8 +399,15 @@ class GrabService:
             order = self.db.get_order(order_id, conn=conn)
             if not order or order.grab_status != "waiting":
                 return "taken", order, g
+            # v2.7.0（审计 P0-3）：只抢「还在待处理」的单。原实现只看 grab_status，
+            # 已回单/已退款的单只要 grab_status 还是 waiting 就能被抢，抢完还能再回一次单。
+            if order.status not in ("pending", "processing"):
+                return "taken", order, g
+            # 不能抢自己下的单（审计 P0-3 后半）：自抢自单等于白拿佣金
+            if order.user_id == user_id:
+                return "不能抢自己提交的报单", order, g
 
-            commission = order.commission or self.commission_for(order)
+            commission = self._safe_commission(order)
             grab_at = _now()
             deadline = _iso(grab_at + timedelta(hours=timeout_h))
             ok = self.db.grab_order_atomic(
@@ -440,34 +522,32 @@ class GrabService:
             if not g:
                 return None, "接单员档案不存在"
 
-            # 订单完工（复用 ShopService 的状态写法，操作者记接单员）
+            # 订单完工：CAS 迁移状态（v2.7.0，审计 P0-4 / N-P0-6）
             now = now_iso()
-            order.status = "completed"
-            order.reply_content = reply_html
-            order.reply_admin_id = grabber_id
-            order.reply_at = now
-            order.completed_at = now
-            order.grab_status = "done"
-            self.db.save_order(order, conn=conn)
-
-            # 佣金冻结入库
-            amount = order.commission or 0
-            if amount > 0:
-                freeze_h = float(self.settings.get("grab_freeze_hours", 24) or 0)
-                frozen_until = "" if freeze_h <= 0 else _iso(_now() + timedelta(hours=freeze_h))
-                self.db.add_grab_commission(
-                    GrabCommission(
-                        order_id=order.id, grabber_id=grabber_id, amount=amount,
-                        status="frozen", frozen_until=frozen_until,
-                    ),
-                    conn=conn,
-                )
-                g.balance_frozen += amount
-                g.total_commission += amount
-
+            amount = self._safe_commission(order)
+            ok = self.db.update_order_fields(
+                order.id,
+                conn=conn,
+                where="grab_status = 'grabbed' AND grabber_id = ?"
+                      " AND status IN ('pending', 'processing')",
+                where_params=(grabber_id,),
+                status="completed",
+                reply_content=reply_html,
+                reply_admin_id=grabber_id,
+                reply_at=now,
+                completed_at=now,
+                grab_status="done",
+                deadline="",
+                commission=amount,
+            )
+            if not ok:
+                return None, "这单已被处理或已释放，请刷新后重试"
+            # 佣金冻结入库：走 ShopService 统一结算口，避免两条回单路径记账口径不一致
+            self.shop._settle_commission_locked(order.id, grabber_id, amount, conn)
+            g = self.db.get_grabber(grabber_id, conn=conn) or g
             g.completed_orders += 1
             self.db.save_grabber(g, conn=conn)
-            return order, None
+            return self.db.get_order(order.id, conn=conn), None
 
     async def after_grabber_complete(self, order: Order, grabber_id: int, copy_from: tuple[int, int] | None = None) -> None:
         """回单后通知链路：买家收货 + 群卡片销单 + 管理员通报 + 立即解冻提示。"""
@@ -521,6 +601,11 @@ class GrabService:
             order = self.db.get_order(order_id, conn=conn)
             if not order or order.grab_status != "grabbed" or order.grabber_id != grabber_id:
                 return False, "这单不在你手上"
+            # v2.7.0（审计 P0-4）：只有还在处理中的单能放弃。
+            # 原实现不判 status，已回单/已退款（但 grab_status 尚未清）的单也能被放弃，
+            # 放弃后又被重派、又被抢、又被回单，一单结两次佣金。
+            if order.status not in ("pending", "processing"):
+                return False, "订单已是终态，无需放弃"
             g = self.db.get_grabber(grabber_id, conn=conn)
             if not g:
                 return False, "接单员档案不存在"
@@ -529,7 +614,21 @@ class GrabService:
             if penalty_min > 0:
                 g.cooldown_until = _iso(_now() + timedelta(minutes=penalty_min))
             self.db.save_grabber(g, conn=conn)
-            self.db.release_grab_order(order_id, conn=conn)
+            # 释放用 CAS：只有仍是 grabbed 且属于本人时才释放，防并发重复释放/覆盖
+            released = self.db.update_order_fields(
+                order_id,
+                conn=conn,
+                where="grab_status = 'grabbed' AND grabber_id = ?",
+                where_params=(grabber_id,),
+                grab_status="waiting",
+                grabber_id=0,
+                grabber_name="",
+                grab_at="",
+                deadline="",
+                warn_sent=0,
+            )
+            if not released:
+                return False, "这单已被处理，无需放弃"
             order = self.db.get_order(order_id, conn=conn)
 
         await self._edit_dispatch_card(

@@ -376,7 +376,8 @@ def page_recharge_history(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
     if not records:
         lines.append("暂无充值记录")
     else:
-        mark = {"pending": "⏳", "completed": "✅", "failed": "❌"}.get
+        # v2.7.0：expired = 冷钱包超时未匹配，待人工核对（与 failed 语义区分）
+        mark = {"pending": "⏳", "completed": "✅", "failed": "❌", "expired": "⌛"}.get
         for r in records:
             lines.append(
                 f"{mark(r.status, '❓')} <code>{r.id}</code>  {r.amount:g} USDT → {r.points} 积分"
@@ -427,8 +428,13 @@ def page_order_detail(user_id: int, order_id: str) -> tuple[str, InlineKeyboardM
         lines.append(f"完成：<code>{fmt_time(o.completed_at)}</code>")
     if o.note:
         lines += ["", f"📎 我提交的信息：\n{h(o.note)}"]
-    if o.reply_content:
+    # v2.7.0（审计 P0-2）：回单内容只在订单已完成后才展示。
+    # 旧实现对任意状态都渲染 reply_content，未发货订单（池模式/待处理）也会漏内容。
+    delivered = o.status == "completed"
+    if o.reply_content and delivered:
         lines += ["", f"📝 回单内容：\n{h(o.reply_content)}"]
+    elif o.reply_content:
+        lines += ["", "📝 回单内容：<i>发货后可见</i>"]
 
     # ---------- 库存池订单（v2.4.0）：展示购得内容与专属编号 ----------
     buttons = []
@@ -437,8 +443,11 @@ def page_order_detail(user_id: int, order_id: str) -> tuple[str, InlineKeyboardM
         item = db.get_stock_item(item_id)
         if item:
             lines += ["", f"📦 购得内容：<b>编号 #{item.id}</b>（{STOCK_TYPES.get(item.content_type, item.content_type)}）"]
-            if item.content_type == "text":
+            # v2.7.0（审计 P0-2）：库存件正文同样只在已完成后才下发
+            if item.content_type == "text" and delivered:
                 lines += ["", f"<code>{h(item.content_text)}</code>"]
+            elif item.content_type == "text":
+                lines.append("<i>内容已锁定，发货后可见</i>")
             else:
                 if item.caption:
                     lines.append(f"说明：{h(item.caption)}")
@@ -470,7 +479,8 @@ def page_balance(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
     ]
     if recharges:
         lines += ["", "<b>最近充值：</b>"]
-        mark = {"pending": "⏳", "completed": "✅", "failed": "❌"}.get
+        # v2.7.0：expired = 冷钱包超时未匹配，待人工核对（与 failed 语义区分）
+        mark = {"pending": "⏳", "completed": "✅", "failed": "❌", "expired": "⌛"}.get
         for r in recharges:
             lines.append(f"{mark(r.status, '❓')} {r.amount:g} USDT → {r.points} 积分")
 

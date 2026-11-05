@@ -433,7 +433,35 @@ class CoreMixin:
                     created_at TEXT DEFAULT ''
                 );
                 CREATE INDEX IF NOT EXISTS idx_ga_status ON grab_appeals(status, id);
+                -- 订单号序列（v2.7.0）：替代 COUNT(*)+1 撞号（审计 P1-3）。
+                -- date 为 YYYYMMDD，seq 为当日已分配的最大序号，严格递增不回收。
+                CREATE TABLE IF NOT EXISTS order_seq (
+                    date TEXT PRIMARY KEY,
+                    seq INTEGER DEFAULT 0,
+                    updated_at TEXT DEFAULT ''
+                );
             """)
+            conn.commit()
+            # 迁移（v2.7.0）：佣金流水一单只允许一条活跃记录（审计 N-P0-6）。
+            # 老库可能已有重复活跃行，先把多余行降级为 voided（留痕不删数据），
+            # 再建部分唯一索引，让「一单只结一次佣」在数据库层成立。
+            conn.execute(
+                "UPDATE grab_commissions SET status = 'voided'"
+                " WHERE order_id <> '' AND status <> 'voided' AND id NOT IN ("
+                " SELECT MIN(id) FROM grab_commissions"
+                " WHERE order_id <> '' AND status <> 'voided' GROUP BY order_id)"
+            )
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uniq_gc_order_active"
+                " ON grab_commissions(order_id) WHERE order_id <> '' AND status <> 'voided'"
+            )
+            conn.commit()
+            # 迁移（v2.7.0）：热索引（审计 P1-9 / N-P1-5）。
+            # 管理员订单分页、抢单超时扫描、派单到期预警全部依赖它们。
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status, created_at)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_orders_created ON orders(created_at)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_recharge_status_created ON recharges(status, created_at)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_gc_status_created ON grab_commissions(status, created_at)")
             conn.commit()
 
             # 迁移：老库的 recharges 表补 gateway 列（支付渠道，老数据默认 okpay）。
@@ -503,6 +531,11 @@ class CoreMixin:
                         logger.info("检测到旧 orders 表结构，补充 %s 列", col)
                         conn.execute(ddl)
                         conn.commit()
+            # v2.7.0：抢单列确保存在后，才能建「派单到期扫描」索引（审计 P1-9）。
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_orders_grab_deadline ON orders(grab_status, deadline)"
+            )
+            conn.commit()
 
             # 迁移：老库 products 表补 commission_pct 列（v2.6.0 抢单佣金比例，-1=跟随全局）。
             cursor = conn.execute("PRAGMA table_info(products)")

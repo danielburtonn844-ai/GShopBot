@@ -7,7 +7,7 @@ import logging
 import os
 import random
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -25,6 +25,7 @@ from .models import (
     Admin,
     Channel,
     Database,
+    GrabCommission,
     Order,
     Product,
     Recharge,
@@ -50,6 +51,10 @@ PAY_GATEWAYS = ("okpay", "kkpay", "trc20", "ton")
 GATEWAY_NAMES = {"okpay": "OkPay", "kkpay": "KKPay", "trc20": "冷钱包·TRON", "ton": "冷钱包·TON"}
 LINK_GATEWAYS = ("okpay", "kkpay")   # 走支付平台链接的渠道
 CHAIN_GATEWAYS = ("trc20", "ton")    # 走冷钱包链上直转的渠道（v2.5.0）
+# v2.7.0（审计 N-P0-2）：冷钱包单宽限期。链上转账天然比支付平台慢，
+# 用户从交易所提币常常要几十分钟到数小时，2 小时就判 failed 会把真实到账的钱吞掉。
+# 宽限期内继续参与链上匹配；超过宽限期仍未匹配到才置 expired（保留人工补单入口）。
+CHAIN_GRACE_HOURS = 72
 
 # 下单失败原因码 → 给用户看的中文提示
 BUY_FAIL_REASONS = {
@@ -323,6 +328,14 @@ class ShopService:
 
         返回 (订单, None) 成功；(None, 原因码) 失败，原因码见 BUY_FAIL_REASONS。
         note: 报单类用户提交的所需信息摘要，会写入订单并展示给管理员。
+
+        v2.7.0 三处硬修（审计 P0-2 / P1-3 / N-P1-3）：
+        1. 积分扣减改走 update_user_points 的 SQL 自增，不再「读 User → 改 → save_user」，
+           并发下单不会互相覆盖余额；
+        2. 订单号改走 order_seq 严格递增表，不再用 COUNT(*)+1（删过单或并发就撞主键）；
+        3. 池模式文字件**不再**把正文写进 order.reply_content。原实现在下单事务里就把
+           卡密写进订单，买家还没收到货、订单还是 completed 时就能在「我的订单」里读到
+           内容，等于绕过发货白拿。正文只在 deliver_item 真正送达成功后回写。
         """
         with self.db.atomic() as conn:
             product = self.db.get_product(product_id, conn=conn)
@@ -330,7 +343,6 @@ class ShopService:
             reason = self._validate_purchase(user, product, conn=conn)
             if reason:
                 return None, reason
-
             # 先生成订单号；池模式在同一事务内原子取货——取不到说明恰好售罄，
             # 此时还没写任何数据，直接返回，积分分文不动（不超卖、不误扣）。
             order_id = self._gen_daily_order_id(conn)
@@ -341,11 +353,12 @@ class ShopService:
                 if not stock_item:
                     return None, "sold_out"
 
-            # 扣积分 + 记流水
-            user.points -= product.points
-            user.total_spent += product.points
-            user.last_active = now_iso()
-            self.db.save_user(user, conn=conn)
+            # 扣积分 + 记流水（SQL 自增，并发安全）
+            self.db.update_user_points(
+                user_id, -product.points, conn=conn, spent_delta=product.points
+            )
+            fresh_user = self.db.get_user(user_id, conn=conn)
+            points_after = fresh_user.points if fresh_user else (user.points - product.points)
 
             # 减库存，扣到 0 自动售罄；池模式同步镜像现货数
             if is_pool:
@@ -375,95 +388,203 @@ class ShopService:
                 completed_at=now_iso() if product.kind == "product" else "",
                 stock_item_id=stock_item.id if stock_item else 0,
             )
-            # 发货内容：固定模式写死的内容；池模式文字件直接写进订单（媒体件由机器人私信送达）
-            if product.kind == "product":
-                if stock_item is not None:
-                    if stock_item.content_type == "text":
-                        order.reply_content = stock_item.content_text
-                    else:
-                        order.reply_content = f"库存池专属内容 编号 #{stock_item.id}（已私信送达）"
-                elif product.auto_delivery:
-                    order.reply_content = product.auto_delivery
+            # 固定模式写死的内容照旧预置；池模式一律留空，等真正送达再回写。
+            if product.kind == "product" and stock_item is None and product.auto_delivery:
+                order.reply_content = product.auto_delivery
             self.db.save_order(order, conn=conn)
-
             self.db.add_point_record(
-                user_id, -product.points, user.points,
+                user_id, -product.points, points_after,
                 f"购买 {product.name}", ref=order.id, conn=conn,
             )
             return order, None
 
     def _gen_daily_order_id(self, conn) -> str:
-        """生成 YYYYMMDD-NNN 格式订单号（日期与全站时区一致）。必须在事务内调用。"""
-        from datetime import datetime
+        """生成 YYYYMMDD-NNN 格式订单号（日期与全站时区一致）。必须在事务内调用。
+
+        序号来源改为 order_seq 表严格递增（审计 P1-3）：原实现按
+        `COUNT(*) WHERE id LIKE 'YYYYMMDD-%'` 算序号，物理删掉一单后计数回退，
+        下一单立刻撞主键；多进程并发也会撞号。
+        """
         today = datetime.now(LOCAL_TZ).strftime("%Y%m%d")
-        row = conn.execute(
-            "SELECT COUNT(*) FROM orders WHERE id LIKE ?",
-            (f"{today}-%",),
-        ).fetchone()
-        seq = (row[0] or 0) + 1
+        seq = self.db.next_order_seq(today, conn=conn)
         return f"{today}-{seq:03d}"
 
     def get_order(self, order_id: str) -> Order | None:
         return self.db.get_order(order_id)
+
+    # ---------- 佣金结算（管理员回单与接单员回单共用） ----------
+
+    def _settle_commission_locked(
+        self, order_id: str, grabber_id: int, amount: int, conn
+    ) -> None:
+        """在调用方事务内给接单员结佣（frozen）。一单只结一次。
+
+        审计 N-P0-6：原实现只在 complete_by_grabber 里结佣，管理员用「完成订单」
+        回单时佣金永远不会产生，接单员白干；且没有唯一约束，重复回单会重复记账。
+        """
+        if amount <= 0 or grabber_id <= 0:
+            return
+        if self.db.get_commission_by_order(order_id, conn=conn):
+            return  # 已有佣金记录（frozen/released/voided），不重复结
+        freeze_h = float(self.db.get_settings().get("grab_freeze_hours", 24) or 0)
+        frozen_until = "" if freeze_h <= 0 else (
+            datetime.now(LOCAL_TZ) + timedelta(hours=freeze_h)
+        ).isoformat()
+        self.db.add_grab_commission(
+            GrabCommission(
+                order_id=order_id,
+                grabber_id=grabber_id,
+                amount=amount,
+                status="frozen",
+                frozen_until=frozen_until,
+            ),
+            conn=conn,
+        )
+        g = self.db.get_grabber(grabber_id, conn=conn)
+        if g:
+            g.balance_frozen += amount
+            g.total_commission += amount
+            self.db.save_grabber(g, conn=conn)
+
+    def _reverse_commission_locked(self, order_id: str, conn) -> None:
+        """退款时冲销佣金。frozen 扣冻结额；released 扣可提现额（允许为负）。
+
+        审计 N-P0-6：原实现退款完全不碰佣金，等于「退了买家积分、接单员照拿佣金」，
+        平台每退一单就净亏一份佣金。
+        """
+        cm = self.db.get_commission_by_order(order_id, conn=conn)
+        if not cm or cm.amount <= 0:
+            return
+        if cm.status not in ("frozen", "released"):
+            return
+        if not self.db.set_commission_status(
+            cm.id, "voided", now_iso(), conn=conn, expect=cm.status
+        ):
+            return  # 并发下已被别的流程改过，让那一方负责记账
+        g = self.db.get_grabber(cm.grabber_id, conn=conn)
+        if not g:
+            return
+        if cm.status == "frozen":
+            g.balance_frozen = max(0, g.balance_frozen - cm.amount)
+        else:
+            # 已解冻进可提现的钱必须真扣掉，允许为负——账不能凭空消失
+            g.balance_available -= cm.amount
+        g.total_commission = max(0, g.total_commission - cm.amount)
+        self.db.save_grabber(g, conn=conn)
 
     def complete_order(self, order_id: str, reply_content: str, admin_id: int) -> Order | None:
         """管理员回单完成。读-改-写放同一事务，防止双击重复完成。
 
         原实现三步不在事务内：两个管理员同时点「完成」都会通过状态检查，
         各写一次，于是用户收到两条回单通知（若接了佣金结算还会重复记账）。
+
+        v2.7.0 补（审计 P0-4）：
+        1. 状态迁移改成 CAS（WHERE status IN ('pending','processing')），不靠读时快照；
+        2. 派单中的单由管理员回单时，佣金照结、grab_status 置 done、清 deadline——
+           否则单子已交付、接单员永远拿不到钱，超时任务还会把它当成未完成再释放一次。
         """
         with self.db.atomic() as conn:
             order = self.db.get_order(order_id, conn=conn)
             if not order or order.status not in ("pending", "processing"):
                 return None  # 已终态的订单拒绝再次回单，防止覆盖
-            order.status = "completed"
-            order.reply_content = reply_content
-            order.reply_admin_id = admin_id
-            order.reply_at = now_iso()
-            order.completed_at = now_iso()
-            self.db.save_order(order, conn=conn)
-            return order
+            now = now_iso()
+            fields: dict[str, Any] = {
+                "status": "completed",
+                "reply_content": reply_content,
+                "reply_admin_id": admin_id,
+                "reply_at": now,
+                "completed_at": now,
+            }
+            settle = bool(order.grabber_id) and order.grab_status in ("waiting", "grabbed")
+            if settle:
+                fields["grab_status"] = "done"
+                fields["deadline"] = ""
+            ok = self.db.update_order_fields(
+                order_id,
+                conn=conn,
+                where="status IN ('pending', 'processing')",
+                **fields,
+            )
+            if not ok:
+                return None  # 并发下已被别人完成/退款，本次放弃
+            if settle:
+                self._settle_commission_locked(
+                    order_id, order.grabber_id, order.commission or 0, conn
+                )
+            return self.db.get_order(order_id, conn=conn)
 
     def refund_order(self, order_id: str, admin_id: int) -> Order | None:
-        """退款关闭。退积分、恢复库存、改状态、记流水在一个事务里原子提交。"""
+        """退款关闭。退积分、恢复库存、冲销佣金、改状态、记流水在同一事务原子提交。
+
+        v2.7.0 补（审计 P0-1 / P0-3 / P0-5 / N-P0-3 / N-P0-6）：
+        1. 必须清掉 stock_item_id 之外的全部派单字段（grab_status/grabber_id/
+           grabber_name/commission/grab_at/deadline）。原实现只改 status，退款单还挂着
+           grab_status='grabbed'，超时任务会反复扫到它、`try_grab` 还能再抢一次；
+        2. 已交付（status='delivered'）的池内货一律 revoke，**绝不回池**——
+           否则同一段数字内容会被卖给第二个人；
+        3. 佣金必须冲销，frozen→voided 扣冻结额，released→扣可提现额（允许为负）；
+        4. 状态迁移用 CAS，防并发重复退款把积分退两次。
+        """
         with self.db.atomic() as conn:
             order = self.db.get_order(order_id, conn=conn)
             if not order or order.status == "refunded":
                 return None
-
-            # 退积分 + 记流水
-            user = self.db.get_user(order.user_id, conn=conn)
-            if user:
-                user.points += order.points
-                user.total_spent = max(0, user.total_spent - order.points)
-                self.db.save_user(user, conn=conn)
-                self.db.add_point_record(
-                    order.user_id, order.points, user.points,
-                    f"退款 订单 {order.id}", operator_id=admin_id, ref=order.id, conn=conn,
-                )
-
+            now = now_iso()
+            # 退积分（SQL 自增，绝不读改写）
+            self.db.update_user_points(
+                order.user_id, order.points, conn=conn, spent_delta=-order.points
+            )
+            fresh_user = self.db.get_user(order.user_id, conn=conn)
+            self.db.add_point_record(
+                order.user_id, order.points, fresh_user.points if fresh_user else 0,
+                f"退款 订单 {order.id}", operator_id=admin_id, ref=order.id, conn=conn,
+            )
             # 恢复库存，售罄的自动回到销售中
             product = self.db.get_product(order.product_id, conn=conn)
+            item = (
+                self.db.get_stock_item(order.stock_item_id, conn=conn)
+                if order.stock_item_id else None
+            )
             if product and self._is_pool(product):
-                # 池模式：本单那件货退回池中重新可售，镜像现货数同步刷新
-                if order.stock_item_id:
-                    self.db.release_stock_item(order.stock_item_id, conn=conn)
+                if item is not None:
+                    if item.status == "delivered":
+                        # 内容已经进了买家手里，作废处理，永不再售
+                        self.db.revoke_stock_item(item.id, conn=conn)
+                    else:
+                        # 从未成功交付（sold）才允许回池；delivered/revoked 由 SQL 守卫
+                        self.db.release_stock_item(item.id, conn=conn)
                 left = self._pool_available(product.id, conn=conn)
                 product.stock = left
-                if product.status == "sold_out" and left > 0:
+                if left > 0 and product.status == "sold_out":
                     product.status = "on"
+                elif left == 0:
+                    product.status = "sold_out"
                 self.db.save_product(product, conn=conn)
             elif product and product.stock >= 0:
                 product.stock += 1
                 if product.status == "sold_out":
                     product.status = "on"
                 self.db.save_product(product, conn=conn)
-
-            order.status = "refunded"
-            order.reply_admin_id = admin_id
-            order.reply_at = now_iso()
-            self.db.save_order(order, conn=conn)
-            return order
+            # 冲销佣金（必须在改订单前读，之后 grabber_id 会被清空）
+            self._reverse_commission_locked(order.id, conn)
+            # 订单终态 + 清空全部派单/回单绑定
+            self.db.update_order_fields(
+                order.id,
+                conn=conn,
+                where="status <> 'refunded'",
+                status="refunded",
+                reply_admin_id=admin_id,
+                reply_at=now,
+                reply_content="",
+                grab_status="",
+                grabber_id=0,
+                grabber_name="",
+                commission=0,
+                grab_at="",
+                deadline="",
+                warn_sent=0,
+            )
+            return self.db.get_order(order.id, conn=conn)
 
     # ---------- 充值 ----------
 
@@ -530,7 +651,8 @@ class ShopService:
         已经付过款（服务停机、支付接口故障期间），必须保留补账途径。
         """
         recharge = self.db.get_recharge(recharge_id)
-        ok_states = ("pending", "failed") if allow_failed else ("pending",)
+        # v2.7.0：expired（冷钱包超时待核对）也允许补查，与 failed 同等对待
+        ok_states = ("pending", "failed", "expired") if allow_failed else ("pending",)
         if not recharge or recharge.status not in ok_states:
             return False
         if recharge.chain:
@@ -565,10 +687,16 @@ class ShopService:
         return False
 
     def complete_recharge(self, recharge_id: str) -> Recharge | None:
-        """手动确认到账（与 check_recharge_status 同一事务口径）。"""
+        """手动确认到账（与 check_recharge_status 同一事务口径）。
+
+        v2.7.0（审计 N-P0-2）：允许补账 failed / expired 单。
+        旧实现只认 pending，而超时单会被自动置 failed，管理员拿着链上凭证
+        也补不进去；expired 是本次新增的「冷钱包超时待核对」态，同样要能补。
+        """
+        _manual_ok = ("pending", "failed", "expired")
         with self.db.atomic() as conn:
             recharge = self.db.get_recharge(recharge_id, conn=conn)
-            if not recharge or recharge.status != "pending":
+            if not recharge or recharge.status not in _manual_ok:
                 return None
 
             recharge.status = "completed"
@@ -701,6 +829,31 @@ class ShopService:
         settings = self.db.get_settings()
         paid: list[Recharge] = []
         pending = [r for r in self.db.list_pending_recharges() if r.chain in CHAIN_GATEWAYS]
+        if not pending:
+            return paid
+
+        # v2.7.0（审计 N-P0-2）：宽限期外仍未匹配的冷钱包单置 expired。
+        # 不能直接 failed：failed 在财务口径里等同「确认未付款」，而链上很可能只是
+        # 还没到账 / 少付 / memo 写错，需要管理员核对后手动补单，expired 明确表示
+        # 「已超时未自动匹配，待人工核对」。
+        from datetime import datetime, timedelta
+
+        grace_cutoff = datetime.now(LOCAL_TZ) - timedelta(hours=CHAIN_GRACE_HOURS)
+        alive: list[Recharge] = []
+        for r in pending:
+            try:
+                created = datetime.fromisoformat(r.created_at)
+                if created.tzinfo is None:
+                    created = created.replace(tzinfo=LOCAL_TZ)
+            except Exception:
+                alive.append(r)
+                continue
+            if created < grace_cutoff:
+                r.status = "expired"
+                self.db.save_recharge(r)
+                continue
+            alive.append(r)
+        pending = alive
         if not pending:
             return paid
 
@@ -1002,24 +1155,28 @@ class ShopService:
                     created = created.replace(tzinfo=LOCAL_TZ)
             except Exception:
                 continue
+            if r.chain:
+                # v2.7.0（审计 N-P0-2）：冷钱包单不在这里过期。
+                # 旧实现超过 2 小时就直接 status='failed'，而 check_chain_recharges
+                # 的匹配池只取 status='pending'，于是「用户 3 小时后才从交易所提币到账」
+                # 这类真实场景下链上钱进了冷钱包、订单却已 failed，永远不会入账。
+                # 冷钱包单的过期交给 check_chain_recharges 的 CHAIN_GRACE_HOURS 宽限期处理。
+                continue
             if created < cutoff:
                 # 过期前必须先查一次账：服务停机 / 支付接口故障 / 队列拥堵期间
                 # 用户可能已经付款，直接标 failed 会让已付款订单永远无法自动补记。
-                if not r.chain:
-                    try:
-                        if await self.check_recharge_status(r.id):
-                            fresh = self.db.get_recharge(r.id)
-                            if fresh:
-                                paid_list.append(fresh)
-                            continue
-                    except Exception as exc:
-                        logger.warning("过期单补查失败 %s：%s", r.id, exc)
-                # 超过 max_age_hours 且确实未支付 → 标记失败，不再轮询（冷钱包单同样过期）
+                try:
+                    if await self.check_recharge_status(r.id):
+                        fresh = self.db.get_recharge(r.id)
+                        if fresh:
+                            paid_list.append(fresh)
+                        continue
+                except Exception as exc:
+                    logger.warning("过期单补查失败 %s：%s", r.id, exc)
+                # 超过 max_age_hours 且确实未支付 → 标记失败，不再轮询
                 r.status = "failed"
                 self.db.save_recharge(r)
                 continue
-            if r.chain:
-                continue  # 冷钱包单走链上监听，不查支付平台
             try:
                 if await self.check_recharge_status(r.id):
                     fresh = self.db.get_recharge(r.id)
