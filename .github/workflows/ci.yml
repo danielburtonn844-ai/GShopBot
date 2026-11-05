@@ -29,8 +29,10 @@ jobs:
       - name: Install runtime dependencies (hash-locked)
         run: pip install --require-hashes -r requirements.lock
 
+      # pytest 必须装：test_p2_9_money.py 是 pytest 原生文件，顶层 import pytest，
+      # 缺了它这一步直接 ImportError 退出码 1（曾经让 CI 整条变红）。
       - name: Install dev tools
-        run: pip install ruff mypy coverage
+        run: pip install ruff mypy coverage pytest
 
       - name: Lint (ruff)
         run: ruff check main.py gshop verify_issues.py

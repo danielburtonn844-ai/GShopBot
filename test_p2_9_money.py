@@ -84,3 +84,13 @@ def test_sqlite_roundtrip_keeps_precision():
 def test_decimal_never_drifts(value):
     d = to_dec(value)
     assert Decimal(str(d)) == Decimal(value)
+
+
+if __name__ == "__main__":
+    # 直接 `python3 test_p2_9_money.py` 也要真跑测试。
+    # 这是 pytest 原生文件，没有顶层 print + sys.exit 的自执行逻辑，
+    # 缺这一段时直接执行会「一个测试都不跑、静默 exit 0」，
+    # CI 里就变成了假绿灯。这里用 pytest 自己的 runner 跑本模块。
+    import sys
+
+    sys.exit(pytest.main([__file__, "-q"]))
