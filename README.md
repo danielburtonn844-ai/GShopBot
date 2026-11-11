@@ -136,7 +136,7 @@ python3 tests/bench_concurrency.py        # 并发压测，10 项（多线程真
 
 全部离线运行（链上 API 走 mock，支付接口走 stub），强制走 `SHOP_DB_PATH` 隔离，不会碰正式库，也不需要联网。
 
-覆盖率（当前 **85.3%**，8075 语句 / 2540 分支，CI 门限 85%）：
+覆盖率（当前 **85.2%**，8207 语句 / 2586 分支，CI 门限 85%）：
 
 ```bash
 pip install coverage

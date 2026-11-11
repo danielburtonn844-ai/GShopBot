@@ -89,7 +89,7 @@ jobs:
       - name: Concurrency bench (real lock contention)
         run: python tests/bench_concurrency.py
 
-      # P2-16: coverage gate raised 75% -> 85%, nine suites in one session.
+      # P2-16: coverage gate raised 75% -> 85%, ten suites in one session.
       - name: Coverage (fail under 85%)
         run: |
           coverage erase
