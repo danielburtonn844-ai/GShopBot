@@ -1,11 +1,14 @@
 """P2-9 money layer: pytest-native tests for gshop.money and the Decimal paths."""
 import os
+import sys
 import tempfile
 from decimal import Decimal
 
 import pytest
 
-from gshop.money import (
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # 仓库根
+
+from gshop.money import (  # noqa: E402
     ZERO,
     dec_str,
     fmt_usdt,
@@ -91,6 +94,4 @@ if __name__ == "__main__":
     # 这是 pytest 原生文件，没有顶层 print + sys.exit 的自执行逻辑，
     # 缺这一段时直接执行会「一个测试都不跑、静默 exit 0」，
     # CI 里就变成了假绿灯。这里用 pytest 自己的 runner 跑本模块。
-    import sys
-
     sys.exit(pytest.main([__file__, "-q"]))

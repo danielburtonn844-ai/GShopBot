@@ -9,12 +9,6 @@ logs
 backups
 *.db
 .env
-test_bot_full.py
-test_extra.py
-test_p2_fixes.py
-test_coverage_boost.py
-test_version_consistency.py
-verify_issues.py
-bench_concurrency.py
+tests
 Dockerfile
 .dockerignore

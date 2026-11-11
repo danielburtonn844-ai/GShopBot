@@ -22,7 +22,8 @@ import sys
 
 import pytest
 
-BASE = os.path.dirname(os.path.abspath(__file__))
+BASE = os.path.dirname(os.path.abspath(__file__))  # tests/：套件脚本所在目录
+ROOT = os.path.dirname(BASE)  # 仓库根：子进程的 cwd
 
 # 顺序即执行顺序：从最快的单元断言到最慢的深度覆盖套件。
 SUITES = [
@@ -47,7 +48,7 @@ def test_suite(script):
         pytest.skip(f"{script} 不存在")
     proc = subprocess.run(
         [sys.executable, path],
-        cwd=BASE,
+        cwd=ROOT,
         capture_output=True,
         text=True,
         timeout=1800,

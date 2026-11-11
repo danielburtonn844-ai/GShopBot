@@ -7,14 +7,23 @@ import sys
 import tempfile
 from decimal import Decimal
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import test_cov_deep  # noqa: E402,F401  复用 Fake 对象与已初始化的运行时
 from test_cov_deep import (  # noqa: E402
-    ADMIN, USER1, USER2, USER3, BOT, FakeBot, FakeCtx, FakeMsg, FakeQuery,
-    FakeUpdate, check, run,
+    ADMIN,
+    BOT,
+    USER1,
+    USER2,
+    USER3,
+    FakeCtx,
+    FakeMsg,
+    FakeQuery,
+    FakeUpdate,
+    check,
+    run,
 )
-from gshop.runtime import db, grab, service, stock, supply  # noqa: E402
 
+from gshop.runtime import db, grab, service  # noqa: E402
 
 # ======================================================================
 # money：Decimal 全链路
@@ -130,6 +139,7 @@ def test_tasks_registry():
 def test_logging_setup():
     print("\n=== logging_setup ===")
     import logging
+
     from gshop import logging_setup as L
 
     tmp = tempfile.mkdtemp(prefix="cov3_log_")
@@ -186,6 +196,7 @@ def test_logging_setup():
 def test_richtext_edges():
     print("\n=== richtext ===")
     from telegram.error import BadRequest
+
     from gshop import richtext as R
 
     check("未定义 TG_ 降级为表情标签", "tg-emoji" in getattr(R, "TG_NOT_DEFINED"))
@@ -253,7 +264,7 @@ def test_richtext_edges():
     check("send_html 正常", m1 is not None and b1.sent)
 
     b2 = SendBot()
-    long_text = "\n".join("line%d %s" % (i, "z" * 40) for i in range(200))
+    long_text = "\n".join(f"line{i} {'z' * 40}" for i in range(200))
     m2 = run(R.send_html(b2, 1, long_text))
     check("send_html 长文本分片", len(b2.sent) >= 2 and m2 is not None)
 
@@ -285,7 +296,9 @@ def test_kkpay_full():
     print("\n=== kkpay ===")
     import base64
     import json as _json
+
     import httpx
+
     from gshop import kkpay as K
 
     c = K.KKPay("MERCHANT", "SECRET", timeout=3.0)
@@ -687,7 +700,6 @@ def test_jobs_all():
 
 def test_main_module():
     print("\n=== main.py ===")
-    import importlib
     import main as M
 
     check("main 可导入", M is not None)
@@ -731,7 +743,6 @@ def test_main_module():
     check("post_shutdown 不抛", True)
 
     # post_init：会用 spawn 拉起 6 个常驻任务，这里换成假函数避免真跑
-    import gshop.jobs as J
     saved = {}
     names = ("auto_check_recharges", "auto_check_chain_recharges", "auto_grab_housekeeping",
              "daily_report", "auto_backup", "auto_heartbeat")

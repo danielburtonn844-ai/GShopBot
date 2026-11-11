@@ -1,18 +1,23 @@
 """覆盖率补强第四批（审计 P2-16）：支付/充值/链上/订单/广播/抢单管家/UI/jobs/main。"""
 from __future__ import annotations
 
-import asyncio
 import os
 import sys
 from decimal import Decimal
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import test_cov_deep  # noqa: E402,F401  复用 Fake 对象与已初始化的运行时
 from test_cov_deep import (  # noqa: E402
-    ADMIN, USER1, USER2, USER3, BOT, FakeBot, FakeCtx, FakeMsg, FakeQuery,
-    FakeUpdate, check, run,
+    ADMIN,
+    USER1,
+    USER2,
+    USER3,
+    FakeMsg,
+    check,
+    run,
 )
-from gshop.runtime import db, grab, service, stock, supply  # noqa: E402
+
+from gshop.runtime import db, grab, service  # noqa: E402
 
 
 def test_payment_gateways():
@@ -133,8 +138,9 @@ def test_recharge_flow():
 
 def test_chain_matching():
     print("\n=== 链上匹配 / 游标 ===")
-    from gshop.chain_watch import ChainTx
     from datetime import datetime, timezone
+
+    from gshop.chain_watch import ChainTx
 
     db.update_settings(pay_tron_enabled=True, tron_wallet_address="TWALLET",
                        pay_ton_enabled=True, ton_wallet_address="TWALLET2")
@@ -235,6 +241,7 @@ def test_order_lifecycle():
 def test_ui_all_branches():
     print("\n=== ui 全分支 ===")
     from telegram.error import BadRequest
+
     from gshop import ui as U
 
     _PHOTO = [type("P", (), {"file_id": "PH1"})()]
@@ -411,7 +418,7 @@ def test_grab_housekeeping():
     check("_calc_commission 0", grab._calc_commission(100, 0) == 0)
     check("_safe_commission 脏数据", isinstance(grab._safe_commission(type("O", (), {"points": 100, "commission": 0, "product_id": None})()), int))
     # 派单卡片文本
-    class O:
+    class FakeOrder:
         def __init__(self):
             self.id = "T1"
             self.note = "需求"
@@ -437,7 +444,7 @@ def test_grab_housekeeping():
             self.grab_at = ""
             self.deadline = ""
             self.stock_item_id = 0
-    check("派单卡文本", "新单待抢" in grab.dispatch_card_text(O(), 10))
+    check("派单卡文本", "新单待抢" in grab.dispatch_card_text(FakeOrder(), 10))
     check("派单键盘", grab._grab_keyboard("T1") is not None)
     # 接单员资格校验
     check("grabber_can_grab None", grab.grabber_can_grab(None) is not None)
@@ -448,23 +455,22 @@ def test_grab_housekeeping():
         grab.set_grabber_status(USER1, "active", operator_id=ADMIN)
         check("激活可抢", grab.grabber_can_grab(db.get_grabber(USER1)) is None)
     # 群卡片编辑：无 bot / 无 dispatch 字段直接返回
-    run(grab._edit_dispatch_card(O(), "x"))
+    run(grab._edit_dispatch_card(FakeOrder(), "x"))
     check("_edit_dispatch_card 无字段不抛", True)
     # 派单：未启用 / 状态不符
     db.update_settings(grab_enabled=False)
-    check("未启用不派单", run(grab.dispatch_order(O())) is False)
+    check("未启用不派单", run(grab.dispatch_order(FakeOrder())) is False)
     db.update_settings(grab_enabled=True)
-    o_park = O()
+    o_park = FakeOrder()
     o_park.grab_status = "waiting"
     check("已 waiting 不重派", run(grab.dispatch_order(o_park)) is False)
-    o_done = O()
+    o_done = FakeOrder()
     o_done.status = "completed"
     check("已终态不派单", run(grab.dispatch_order(o_done)) is False)
     # 重派：超过最大次数
     db.update_settings(grab_max_dispatch=1)
-    o_max = O()
+    o_max = FakeOrder()
     o_max.dispatch_count = 5
-    from gshop.models import now_iso as _now_iso
     real = service.create_product({"name": "重派测", "kind": "report", "points": 10})
     ro, _ = service.create_order(USER3, real.id)
     check("重派测试单", ro is not None)

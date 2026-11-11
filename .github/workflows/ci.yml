@@ -23,7 +23,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
 
-      # P2-16: runtime deps pinned by hash. requirements.txt only lists direct
+      # P2-16: runtime deps pinned by hash. pyproject.toml only lists direct
       # deps, transitive ones drift to latest on every install, so one bad
       # upstream release silently changes runtime behaviour.
       - name: Install runtime dependencies (hash-locked)
@@ -35,10 +35,10 @@ jobs:
         run: pip install ruff mypy coverage pytest
 
       - name: Lint (ruff)
-        run: ruff check main.py gshop verify_issues.py
+        run: ruff check main.py gshop tests
 
       - name: Syntax check
-        run: python -m compileall -q main.py gshop verify_issues.py
+        run: python -m compileall -q main.py gshop tests
 
       # P2-16: normal mode must be clean (hard gate).
       - name: Type check (mypy)
@@ -53,56 +53,56 @@ jobs:
             --disable-error-code=no-untyped-call \
             --disable-error-code=type-arg
 
-      - name: Self-check (7200+ assertions, no network)
-        run: python test_bot_full.py
+      - name: Self-check (7231 assertions, no network)
+        run: python tests/test_bot_full.py
 
       - name: Issue regression tests
-        run: python verify_issues.py
+        run: python tests/verify_issues.py
 
       - name: Extra branch coverage tests
-        run: python test_extra.py
+        run: python tests/test_extra.py
 
       - name: Deep coverage tests
-        run: python test_coverage_boost.py
+        run: python tests/test_coverage_boost.py
 
       - name: P2 fix regression tests
-        run: python test_p2_fixes.py
+        run: python tests/test_p2_fixes.py
       # v2.8.1: 4 个业务硬伤（补单入口 / 负价兜底 / 拉群接管 / 丢更新）
       - name: v2.8.1 fix regression tests
-        run: python test_v281_fixes.py
+        run: python tests/test_v281_fixes.py
 
       - name: P2-9 Decimal money tests
-        run: python test_p2_9_money.py
+        run: python tests/test_p2_9_money.py
 
       - name: Version consistency tests
-        run: python test_version_consistency.py
+        run: python tests/test_version_consistency.py
 
       - name: Deep coverage suite 1
-        run: python test_cov_deep.py
+        run: python tests/test_cov_deep.py
 
       - name: Deep coverage suite 2
-        run: python test_cov_deep2.py
+        run: python tests/test_cov_deep2.py
 
       - name: Deep coverage suite 3
-        run: python test_cov_deep3.py
+        run: python tests/test_cov_deep3.py
 
       - name: Concurrency bench (real lock contention)
-        run: python bench_concurrency.py
+        run: python tests/bench_concurrency.py
 
       # P2-16: coverage gate raised 75% -> 85%, nine suites in one session.
       - name: Coverage (fail under 85%)
         run: |
           coverage erase
-          coverage run --source=gshop,main test_bot_full.py
-          coverage run -a --source=gshop,main test_extra.py
-          coverage run -a --source=gshop,main test_coverage_boost.py
-          coverage run -a --source=gshop,main verify_issues.py
-          coverage run -a --source=gshop,main test_p2_fixes.py
-          coverage run -a --source=gshop,main test_v281_fixes.py
-          coverage run -a --source=gshop,main test_p2_9_money.py
-          coverage run -a --source=gshop,main test_cov_deep.py
-          coverage run -a --source=gshop,main test_cov_deep2.py
-          coverage run -a --source=gshop,main test_cov_deep3.py
+          coverage run --source=gshop,main tests/test_bot_full.py
+          coverage run -a --source=gshop,main tests/test_extra.py
+          coverage run -a --source=gshop,main tests/test_coverage_boost.py
+          coverage run -a --source=gshop,main tests/verify_issues.py
+          coverage run -a --source=gshop,main tests/test_p2_fixes.py
+          coverage run -a --source=gshop,main tests/test_v281_fixes.py
+          coverage run -a --source=gshop,main tests/test_p2_9_money.py
+          coverage run -a --source=gshop,main tests/test_cov_deep.py
+          coverage run -a --source=gshop,main tests/test_cov_deep2.py
+          coverage run -a --source=gshop,main tests/test_cov_deep3.py
           coverage report --fail-under=85 --skip-covered
 
       - name: Import smoke test

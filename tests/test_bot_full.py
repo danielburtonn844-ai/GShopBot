@@ -30,7 +30,7 @@ os.environ["ADMIN_ID"] = "100000000"
 os.environ["OKPAY_ID"] = ""
 os.environ["OKPAY_TOKEN"] = ""
 
-BASE = os.path.dirname(os.path.abspath(__file__))
+BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # 仓库根
 sys.path.insert(0, BASE)
 
 # 用一个独立测试数据库——绝不触碰正式 data/shop.db！

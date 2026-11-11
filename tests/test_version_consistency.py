@@ -13,7 +13,7 @@ import re
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent.parent  # tests/ 的上一级＝仓库根
 OK = 0
 BAD = 0
 
@@ -103,7 +103,9 @@ def main() -> int:
     )
 
     offenders = []
-    for path in list(ROOT.glob("*.py")) + list((ROOT / "gshop").rglob("*.py")):
+    scanned = list(ROOT.glob("*.py")) + list((ROOT / "gshop").rglob("*.py"))
+    scanned += list((ROOT / "tests").rglob("*.py"))
+    for path in scanned:
         if path.name == "test_version_consistency.py":
             continue
         for ln, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):

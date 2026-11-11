@@ -15,7 +15,7 @@ import os
 import sys
 import tempfile
 
-BASE = os.path.dirname(os.path.abspath(__file__))
+BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # 仓库根
 sys.path.insert(0, BASE)
 os.environ.setdefault("BOT_TOKEN", "test:token")
 os.environ.setdefault("ADMIN_ID", "100000000")

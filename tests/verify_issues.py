@@ -11,7 +11,8 @@ import os
 import sys
 import tempfile
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # 仓库根
+sys.path.insert(0, ROOT)
 
 os.environ.setdefault("BOT_TOKEN", "test:token")
 os.environ.setdefault("ADMIN_ID", "100000000")
@@ -159,8 +160,7 @@ def test_issue2() -> None:
 # ==================================================================
 def test_issue3() -> None:
     print("\n=== Issue #3：allowed_updates 订阅 ===")
-    src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "main.py"),
-               encoding="utf-8").read()
+    src = open(os.path.join(ROOT, "main.py"), encoding="utf-8").read()
 
     check("run_polling 传入 allowed_updates",
           "allowed_updates=ALLOWED_UPDATES" in src)

@@ -11,7 +11,8 @@ import sqlite3
 import sys
 import tempfile
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.environ.setdefault("BOT_TOKEN", "test:token")
 os.environ.setdefault("ADMIN_ID", "100000000")
 _TMP = tempfile.mkdtemp(prefix="p2fix_")
@@ -144,7 +145,7 @@ def test_backup():
         c.close()
     check("备份内容可读", rows > 0, str(rows))
     check("integrity_check = ok", ok == "ok", ok)
-    jsrc = open("gshop/jobs.py", encoding="utf-8").read()
+    jsrc = open(os.path.join(ROOT, "gshop", "jobs.py"), encoding="utf-8").read()
     check("不再 import shutil", "import shutil" not in jsrc)
     check("改用 SQLite backup API", ".backup(" in jsrc)
 
@@ -162,7 +163,7 @@ def test_admin_id_parse():
     check("零→0", _parse_admin_id("0") == 0)
     check("带空格可解析", _parse_admin_id(" 123 ") == 123)
 
-    src = open("gshop/runtime.py", encoding="utf-8").read()
+    src = open(os.path.join(ROOT, "gshop", "runtime.py"), encoding="utf-8").read()
     check("0 号管理员不再无条件建档", "if ADMIN_ID > 0:" in src)
 
 
@@ -252,17 +253,17 @@ def test_aclose():
             check("close 抛错不影响停机", False, repr(exc))
 
     run(body())
-    check("post_shutdown 挂到 builder", ".post_shutdown(post_shutdown)" in open("main.py", encoding="utf-8").read())
+    check("post_shutdown 挂到 builder", ".post_shutdown(post_shutdown)" in open(os.path.join(ROOT, "main.py"), encoding="utf-8").read())
 
 
 # --------------------------------------------------------------- N-P2-1/3
 def test_appeal_and_answer():
     print("\n=== N-P2-1/N-P2-3  申诉归属校验 / 回调应答兜底 ===")
-    src = open("gshop/grab_service.py", encoding="utf-8").read()
+    src = open(os.path.join(ROOT, "gshop", "grab_service.py"), encoding="utf-8").read()
     check("申诉含订单归属校验", "该订单不属于你" in src)
     check("申诉含重复提交拦截", "已有待裁定申诉" in src)
 
-    hc = open("gshop/handlers_callback.py", encoding="utf-8").read()
+    hc = open(os.path.join(ROOT, "gshop", "handlers_callback.py"), encoding="utf-8").read()
     check("query.answer 有 try 兜底", "回调应答失败" in hc)
 
 

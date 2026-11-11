@@ -3,12 +3,13 @@ grab_service 全流程 / ui 降级 / singleton / jobs / kkpay 验签 / handlers_
 全部离线：临时 SQLite，Telegram 走 fake，HTTP 不触达。
 """
 from __future__ import annotations
+
 import asyncio
 import os
 import sys
 import tempfile
 
-BASE = os.path.dirname(os.path.abspath(__file__))
+BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # 仓库根
 sys.path.insert(0, BASE)
 _TMP = tempfile.mkdtemp(prefix="covdeep_")
 os.environ["BOT_TOKEN"] = "test:token"
@@ -110,7 +111,7 @@ class FakeBot:
 
     async def get_me(self):
         return type("Me", (), {"username": self.username, "id": self.id})()
-        
+
 
 
 class FakeMsg:
@@ -204,13 +205,12 @@ class FakeCtx:
         self.bot = bot or FakeBot()
         self.args = []
         self.error = None
-        
 
 
-from gshop import handlers_callback, handlers_command, handlers_message  # noqa: E402
+
+from gshop import handlers_callback, handlers_message  # noqa: E402
 from gshop.runtime import db, grab, service, stock, supply  # noqa: E402
-from gshop.ui import kb, h, summarize_message, order_status_text, product_status_text  # noqa: E402
-
+from gshop.ui import h, kb, order_status_text, product_status_text, summarize_message  # noqa: E402
 
 BOT = FakeBot()
 service.set_bot(BOT)
@@ -252,7 +252,7 @@ def fire_cb(uid, data, ctx=None, message=None):
 
 def state_ctx(state, payload=None):
     return FakeCtx({"state": state, "payload": payload if payload is not None else {}})
-        
+
 
 
 def test_user_states():
@@ -325,7 +325,7 @@ def test_grab_states():
     # gbwdtx 不存在的提现单
     m, _ = fire_msg(ADMIN, "跳过", state_ctx("gbwdtx:NOPE"))
     check("gbwdtx 无效单提示", bool(m.replies))
-        
+
 
 
 def test_supply_states():
@@ -411,7 +411,7 @@ def test_product_states():
         check("pedit 改名成功", db.get_product(pid).name == "新名字")
         m, _ = fire_msg(ADMIN, "新介绍", state_ctx("pedit:" + pid + ":description"), photo=photo)
         check("pedit 带图改介绍", bool(m.replies))
-        
+
 
 
 def test_admin_states():
@@ -545,7 +545,7 @@ def test_settings_states():
     check("sup_set 正常", int(db.get_settings().get("supply_price_bot")) == 5)
     m, _ = fire_msg(ADMIN, "0", state_ctx("sup_set:supply_daily_limit"))
     check("sup_set 允许 0", int(db.get_settings().get("supply_daily_limit")) == 0)
-        
+
 
 
 def test_broadcast_states():
@@ -640,7 +640,7 @@ def test_callback_grab_actions():
     # a:gstog: / a:gsedit:
     fire_cb(ADMIN, "a:gstog:grab_enabled")
     fire_cb(ADMIN, "a:gsedit:grab_commission_pct")
-        
+
 
 
 def test_grab_full_flow():
@@ -724,12 +724,13 @@ def test_grab_withdraw_and_appeal():
         h1 = grab.handle_appeal(ap.id, ADMIN, True, "通过")
         check("申诉裁定", h1 is not None)
         check("重复裁定返回 None", grab.handle_appeal(ap.id, ADMIN, True) is None)
-        
+
 
 
 def test_ui_degrade():
     print("\n=== ui 降级 / send_or_edit ===")
     from telegram.error import BadRequest
+
     from gshop import ui
 
     class BadMsg(FakeMsg):
@@ -782,6 +783,7 @@ def test_ui_degrade():
 def test_singleton_and_health():
     print("\n=== singleton / 健康文件 ===")
     import shutil
+
     from gshop import singleton
     d = os.path.join(_TMP, "lk")
     shutil.rmtree(d, ignore_errors=True)
@@ -843,7 +845,7 @@ def test_command_handlers():
     err_ctx.error = RuntimeError("模拟异常")
     run(HC.on_error(FakeUpdate(USER1, message=FakeMsg(USER1)), err_ctx))
     check("on_error 不抛异常", True)
-        
+
 
 
 def test_supply_full_flow():
@@ -972,7 +974,7 @@ def test_callback_supply_actions():
     fire_cb(ADMIN, "a:sup:set:supply_price_bot")
     fire_cb(ADMIN, "a:sup:chid")
     check("供需管理回调不崩", True)
-        
+
 
 
 def test_admin_callback_actions():
@@ -1042,7 +1044,6 @@ def test_admin_callback_actions():
 
 def test_stock_pool():
     print("\n=== 库存池 ===")
-    from gshop.stock_service import StockService
     p = service.create_product({
         "name": "池测", "kind": "product", "points": 5, "stock": 0,
         "delivery_mode": "pool",
@@ -1076,7 +1077,7 @@ def test_main_module():
     m = importlib.import_module("main")
     check("main 可导入", m is not None)
     check("main 有 main()", callable(getattr(m, "main", None)))
-        
+
 
 
 if __name__ == "__main__":

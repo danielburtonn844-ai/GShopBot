@@ -1,5 +1,0 @@
-# G Shop Bot · 运行依赖
-# 版本锁定：PTB 21→22 有破坏性变更，>= 会在某天 pip install 时装到不兼容版本
-python-telegram-bot==22.8
-python-dotenv==1.2.4
-httpx==0.28.1

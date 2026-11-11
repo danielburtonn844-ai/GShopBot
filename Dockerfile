@@ -13,8 +13,8 @@ RUN apt-get update \
     && echo $TZ > /etc/timezone \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+COPY requirements.lock ./
+RUN pip install --no-cache-dir --require-hashes -r requirements.lock
 
 COPY gshop ./gshop
 COPY main.py VERSION ./

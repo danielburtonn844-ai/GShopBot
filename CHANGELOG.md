@@ -1,5 +1,39 @@
 # CHANGELOG — G Shop Bot
 
+## 仓库整理（未发版）
+
+> 纯结构整治，不改任何业务逻辑。全部改动通过原有 12 套脚本回归（8134 断言全绿）。
+
+### 目录结构
+
+- **删除 `examples/`**：v2.6.1 把包名从 `examples/` 改成 `gshop/` 时遗留的旧树（41 个文件）。
+  它与主干已经脱节（连 `gshop/money.py` 都没有，冻结在 Decimal 重构之前），且不落在
+  任何 lint / 测试 / CI 的范围内，属于只会误导人的僵尸代码。
+- **测试脚本统一移入 `tests/`**：根目录原本平铺 13 个脚本（约 7000 行），现在根目录
+  只剩 `main.py` 一个 `.py`。各脚本的路径基准从「脚本所在目录」改为「仓库根」，
+  `test_suites.py` 的子进程 cwd 一并指向仓库根。
+- **删除 `_covshim.py`**：与 `sitecustomize.py` 完全重复的死代码（全仓无引用）。
+- **删除 `requirements.txt`**：与 `pyproject.toml` + `requirements.lock` 三重复，
+  且内容未锁版本，留着只会让人装错。
+- `.env.example` 删掉死键 `HEALTH_PORT`（代码从未读取）。
+- `Dockerfile` 改用 `requirements.lock` + `--require-hashes`，构建期依赖与运行期一致。
+
+### 工程配置
+
+- CI 的 ruff / compileall 范围从「main.py + gshop + verify_issues.py」扩到整个 `tests/`，
+  并顺手清掉 3 个深度覆盖套件里 41 条从未被 lint 过的债务（未用导入 / 导入排序 /
+  行尾空白 / printf 格式 / 歧义类名 `O`）。
+- `pyproject.toml`：覆盖率排除规则按目录收口；ruff 单文件豁免改用 `tests/*.py` 统配
+  （原来写死两个已移动的文件名，移动后直接失效）。
+
+### 文档
+
+- README 技术要点表尾部重复了 4 行（复制的残迹），已删。
+- README 结构树重写为真实布局；补上漏登记的 `test_v281_fixes.py`。
+- 全面对齐实测数字：自检断言 7236 → 7231，套件数 10 → 11，覆盖率命令块补上
+  漏掉的 `test_v281_fixes.py`（CI 里有、README 里没有，两边一直不一致）。
+- 「Dockerfile 多阶段构建」改为事实描述（实际是单阶段 slim）。
+
 ## v2.8.1 · 2026-11-06
 
 > v2.8.0 发布后复核出的 4 个业务硬伤。全是「代码里有、线上走不到」或

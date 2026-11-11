@@ -37,8 +37,9 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"test_bot_full.py" = ["E402", "F841", "B"]
-"verify_issues.py" = ["E402"]
+# 测试脚本统一在导入业务包前把仓库根插入 sys.path（E402），
+# 且大量使用宽松的动态断言（F841 / B）。
+"tests/*.py" = ["E402", "F841", "B"]
 
 [tool.setuptools.dynamic]
 version = {file = ["VERSION"]}
@@ -46,7 +47,7 @@ version = {file = ["VERSION"]}
 [tool.coverage.run]
 source = ["gshop", "main"]
 branch = true
-omit = ["*/tests/*", "test_*.py", "verify_issues.py", "bench_*.py"]
+omit = ["*/tests/*"]
 
 [tool.coverage.report]
 precision = 1
@@ -92,7 +93,6 @@ module = [
     "conftest",
     "bench_concurrency",
     "sitecustomize",
-    "_covshim",
 ]
 ignore_errors = true
 
